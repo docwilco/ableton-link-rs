@@ -41,9 +41,19 @@ if-addrs = "0.10.2"
 [dependencies.libc]
 version = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winnt", "profileapi", "libloaderapi", "processthreadsapi", "iphlpapi", "iptypes", "ws2def", "winerror"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
 [dev-dependencies]
 console-subscriber = "0.2.0"
 
 [[example]]
 name = "rusthut"
 path = "examples/rusthut.rs"
+
+[[example]]
+name = "platform_demo"
+path = "examples/platform_demo.rs"

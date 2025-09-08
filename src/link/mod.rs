@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+pub mod atomic_session_state;
 pub mod beats;
 pub mod clock;
 pub mod controller;
@@ -27,11 +28,11 @@ use std::{
 use chrono::Duration;
 
 use self::{
+    atomic_session_state::AtomicSessionState,
     beats::Beats,
     clock::Clock,
     controller::Controller,
     phase::{force_beat_at_time_impl, from_phase_encoded_beats, phase, to_phase_encoded_beats},
-    rt_session_state::RtSessionStateHandler,
     state::{ClientStartStopState, ClientState},
     tempo::Tempo,
     timeline::{clamp_tempo, Timeline},
@@ -49,7 +50,7 @@ pub struct BasicLink {
     start_stop_callback: Option<StartStopCallback>,
     controller: Controller,
     clock: Clock,
-    rt_session_handler: Option<RtSessionStateHandler>,
+    atomic_session_state: AtomicSessionState,
     last_is_playing_for_callback: bool,
 }
 
@@ -59,8 +60,31 @@ impl BasicLink {
         let _ = tracing_subscriber::fmt::try_init();
 
         let clock = Clock::default();
-
         let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
+
+        // Create initial client state for atomic session state
+        let initial_client_state = if let Ok(client_state_guard) = controller.client_state.try_lock() {
+            *client_state_guard
+        } else {
+            // Fallback to default state if we can't get the lock
+            ClientState {
+                timeline: Timeline {
+                    tempo: Tempo::new(bpm),
+                    beat_origin: Beats::new(0.0),
+                    time_origin: Duration::zero(),
+                },
+                start_stop_state: ClientStartStopState {
+                    is_playing: false,
+                    time: Duration::zero(),
+                    timestamp: Duration::zero(),
+                },
+            }
+        };
+
+        let atomic_session_state = AtomicSessionState::new(
+            initial_client_state,
+            controller::LOCAL_MOD_GRACE_PERIOD,
+        );
 
         Self {
             peer_count_callback: None,
@@ -68,7 +92,7 @@ impl BasicLink {
             start_stop_callback: None,
             controller,
             clock,
-            rt_session_handler: None,
+            atomic_session_state,
             last_is_playing_for_callback: false,
         }
     }
@@ -77,10 +101,16 @@ impl BasicLink {
 impl BasicLink {
     pub async fn enable(&mut self) {
         self.controller.enable().await;
+        
+        // Update the atomic session state to reflect the new enable state
+        self.atomic_session_state.set_enabled(true);
     }
 
     pub async fn disable(&mut self) {
         self.controller.disable().await;
+        
+        // Update the atomic session state to reflect the new enable state
+        self.atomic_session_state.set_enabled(false);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -151,70 +181,18 @@ impl BasicLink {
         self.clock
     }
 
-    pub fn capture_audio_session_state(&mut self) -> SessionState {
-        // Initialize rt_session_handler if not already done
-        if self.rt_session_handler.is_none() {
-            if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
-                let client_state = *client_state_guard;
-                self.rt_session_handler = Some(RtSessionStateHandler::new(
-                    client_state,
-                    controller::LOCAL_MOD_GRACE_PERIOD,
-                ));
-            } else {
-                // If we can't get the lock, return a default state
-                return SessionState::default();
-            }
-        }
-
-        // For real-time access, we use the rt_session_handler
-        if let Some(ref handler) = self.rt_session_handler {
-            let client_state = handler.get_rt_client_state(self.clock.micros());
-            to_session_state(&client_state, self.num_peers() > 0)
-        } else {
-            // Fallback to non-realtime access
-            if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
-                to_session_state(&client_state_guard, self.num_peers() > 0)
-            } else {
-                SessionState::default()
-            }
-        }
+    pub fn capture_audio_session_state(&self) -> SessionState {
+        // Real-time safe capture using atomic session state
+        let current_time = self.clock.micros();
+        let client_state = self.atomic_session_state.capture_audio_session_state(current_time);
+        to_session_state(&client_state, self.num_peers() > 0)
     }
 
-    pub fn commit_audio_session_state(&mut self, state: SessionState) {
+    pub fn commit_audio_session_state(&self, state: SessionState) {
+        // Real-time safe commit using atomic session state
         let current_time = self.clock.micros();
-        let is_enabled = self.is_enabled();
-
-        let incoming_state =
-            to_incoming_client_state(&state.state, &state.original_state, current_time);
-
-        // Use real-time handler if available
-        if let Some(ref mut handler) = self.rt_session_handler {
-            handler.update_rt_client_state(incoming_state, current_time, is_enabled);
-
-            // Process any pending updates to sync with the main controller
-            if let Some(processed_state) = handler.process_pending_updates() {
-                // This should be done asynchronously in a real implementation
-                // For now, we'll update the controller state directly
-                if let Ok(mut client_state) = self.controller.client_state.try_lock() {
-                    if let Some(timeline) = processed_state.timeline {
-                        client_state.timeline = timeline;
-                    }
-                    if let Some(start_stop_state) = processed_state.start_stop_state {
-                        client_state.start_stop_state = start_stop_state;
-                    }
-                }
-            }
-        } else {
-            // Fallback to the original non-realtime method
-            if let Ok(mut client_state) = self.controller.client_state.try_lock() {
-                if let Some(timeline) = incoming_state.timeline {
-                    client_state.timeline = timeline;
-                }
-                if let Some(start_stop_state) = incoming_state.start_stop_state {
-                    client_state.start_stop_state = start_stop_state;
-                }
-            }
-        }
+        let incoming_state = to_incoming_client_state(&state.state, &state.original_state, current_time);
+        self.atomic_session_state.commit_audio_session_state(incoming_state, current_time);
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {

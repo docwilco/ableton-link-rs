@@ -42,7 +42,16 @@ if-addrs = "0.10.2"
 version = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winnt", "profileapi", "libloaderapi", "processthreadsapi", "iphlpapi", "iptypes", "ws2def", "winerror"] }
+winapi = { version = "0.3", features = [
+    "winnt",
+    "profileapi",
+    "libloaderapi",
+    "processthreadsapi",
+    "iphlpapi",
+    "iptypes",
+    "ws2def",
+    "winerror",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"

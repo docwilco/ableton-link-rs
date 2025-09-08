@@ -2,8 +2,8 @@
 // Based on the C++ implementation's platform abstractions
 
 pub mod clock;
-pub mod thread;
 pub mod network;
+pub mod thread;
 
 // Re-export platform-specific types based on current platform
 #[cfg(target_os = "macos")]

@@ -14,7 +14,7 @@ pub mod node;
 pub mod payload;
 pub mod phase;
 pub mod pingresponder;
-pub mod rt_session_state;
+pub mod safe_rt_session_state;
 pub mod sessions;
 pub mod state;
 pub mod tempo;
@@ -63,28 +63,27 @@ impl BasicLink {
         let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
 
         // Create initial client state for atomic session state
-        let initial_client_state = if let Ok(client_state_guard) = controller.client_state.try_lock() {
-            *client_state_guard
-        } else {
-            // Fallback to default state if we can't get the lock
-            ClientState {
-                timeline: Timeline {
-                    tempo: Tempo::new(bpm),
-                    beat_origin: Beats::new(0.0),
-                    time_origin: Duration::zero(),
-                },
-                start_stop_state: ClientStartStopState {
-                    is_playing: false,
-                    time: Duration::zero(),
-                    timestamp: Duration::zero(),
-                },
-            }
-        };
+        let initial_client_state =
+            if let Ok(client_state_guard) = controller.client_state.try_lock() {
+                *client_state_guard
+            } else {
+                // Fallback to default state if we can't get the lock
+                ClientState {
+                    timeline: Timeline {
+                        tempo: Tempo::new(bpm),
+                        beat_origin: Beats::new(0.0),
+                        time_origin: Duration::zero(),
+                    },
+                    start_stop_state: ClientStartStopState {
+                        is_playing: false,
+                        time: Duration::zero(),
+                        timestamp: Duration::zero(),
+                    },
+                }
+            };
 
-        let atomic_session_state = AtomicSessionState::new(
-            initial_client_state,
-            controller::LOCAL_MOD_GRACE_PERIOD,
-        );
+        let atomic_session_state =
+            AtomicSessionState::new(initial_client_state, controller::LOCAL_MOD_GRACE_PERIOD);
 
         Self {
             peer_count_callback: None,
@@ -101,14 +100,14 @@ impl BasicLink {
 impl BasicLink {
     pub async fn enable(&mut self) {
         self.controller.enable().await;
-        
+
         // Update the atomic session state to reflect the new enable state
         self.atomic_session_state.set_enabled(true);
     }
 
     pub async fn disable(&mut self) {
         self.controller.disable().await;
-        
+
         // Update the atomic session state to reflect the new enable state
         self.atomic_session_state.set_enabled(false);
     }
@@ -184,15 +183,19 @@ impl BasicLink {
     pub fn capture_audio_session_state(&self) -> SessionState {
         // Real-time safe capture using atomic session state
         let current_time = self.clock.micros();
-        let client_state = self.atomic_session_state.capture_audio_session_state(current_time);
+        let client_state = self
+            .atomic_session_state
+            .capture_audio_session_state(current_time);
         to_session_state(&client_state, self.num_peers() > 0)
     }
 
     pub fn commit_audio_session_state(&self, state: SessionState) {
         // Real-time safe commit using atomic session state
         let current_time = self.clock.micros();
-        let incoming_state = to_incoming_client_state(&state.state, &state.original_state, current_time);
-        self.atomic_session_state.commit_audio_session_state(incoming_state, current_time);
+        let incoming_state =
+            to_incoming_client_state(&state.state, &state.original_state, current_time);
+        self.atomic_session_state
+            .commit_audio_session_state(incoming_state, current_time);
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {

@@ -37,6 +37,7 @@ termios = "0.3"
 triple_buffer = "8.1.1"
 rodio = "0.21.1"
 if-addrs = "0.10.2"
+network-interface = "2.0.3"
 
 [dependencies.libc]
 version = "0.2"

@@ -1,242 +1,92 @@
 // Platform-specific network interface scanning optimizations
 // Based on Ableton Link's interface detection implementations
+// Now using 100% safe Rust implementations!
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, error};
+use network_interface::NetworkInterfaceConfig;
 
-/// Platform-optimized network interface scanner
+/// Safe Rust implementation using the network-interface crate
+/// This provides cross-platform network interface scanning without unsafe code
 pub async fn scan_network_interfaces() -> Vec<IpAddr> {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
-    {
-        scan_posix_interfaces().await
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        scan_windows_interfaces().await
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "windows")))]
-    {
-        scan_generic_interfaces().await
-    }
+    tokio::task::spawn_blocking(|| {
+        scan_interfaces_safe()
+    }).await.unwrap_or_else(|e| {
+        error!("Failed to scan network interfaces: {}", e);
+        Vec::new()
+    })
 }
 
-// POSIX implementation using getifaddrs directly for maximum performance
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
-async fn scan_posix_interfaces() -> Vec<IpAddr> {
+// Safe implementation using the network-interface crate
+fn scan_interfaces_safe() -> Vec<IpAddr> {
     use std::collections::HashMap;
-    use std::ffi::CStr;
-    use std::mem;
-    use std::ptr;
+    
+    let mut addresses = Vec::new();
+    let mut ipv4_interfaces: HashMap<String, IpAddr> = HashMap::new();
 
-    tokio::task::spawn_blocking(|| {
-        let mut addresses = Vec::new();
-        let mut ipv4_interfaces: HashMap<String, IpAddr> = HashMap::new();
-
-        unsafe {
-            let mut ifaddrs_ptr: *mut libc::ifaddrs = ptr::null_mut();
-            if libc::getifaddrs(&mut ifaddrs_ptr) != 0 {
-                error!("Failed to call getifaddrs");
-                return addresses;
-            }
-
+    // Get network interfaces using the safe network-interface crate
+    match network_interface::NetworkInterface::show() {
+        Ok(interfaces) => {
             // First pass: collect IPv4 addresses
-            let mut current = ifaddrs_ptr;
-            while !current.is_null() {
-                let ifaddr = &*current;
-                
-                if !ifaddr.ifa_addr.is_null() && (ifaddr.ifa_flags & libc::IFF_RUNNING as u32) != 0 {
-                    let sa_family = (*ifaddr.ifa_addr).sa_family;
-                    
-                    if u16::from(sa_family) == libc::AF_INET as u16 {
-                        let sockaddr_in = &*(ifaddr.ifa_addr as *const libc::sockaddr_in);
-                        let addr_bytes = sockaddr_in.sin_addr.s_addr.to_ne_bytes();
-                        let ipv4 = Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]);
-                        let ip_addr = IpAddr::V4(ipv4);
+            for interface in &interfaces {
+                if !interface.addr.is_empty() {
+                    for addr in &interface.addr {
+                        let ip_addr = addr.ip();
                         
-                        if is_usable_interface(&ip_addr) {
-                            addresses.push(ip_addr);
-                            if let Ok(name) = CStr::from_ptr(ifaddr.ifa_name).to_str() {
-                                ipv4_interfaces.insert(name.to_string(), ip_addr);
+                        if let IpAddr::V4(ipv4) = ip_addr {
+                            if is_usable_ipv4(&ipv4) {
+                                addresses.push(ip_addr);
+                                ipv4_interfaces.insert(interface.name.clone(), ip_addr);
+                                debug!("Found IPv4 interface: {} ({})", interface.name, ip_addr);
                             }
                         }
                     }
                 }
-                
-                current = ifaddr.ifa_next;
             }
 
             // Second pass: collect IPv6 addresses only for interfaces that have IPv4
-            current = ifaddrs_ptr;
-            while !current.is_null() {
-                let ifaddr = &*current;
-                
-                if !ifaddr.ifa_addr.is_null() && (ifaddr.ifa_flags & libc::IFF_RUNNING as u32) != 0 {
-                    let sa_family = (*ifaddr.ifa_addr).sa_family;
-                    
-                    if u16::from(sa_family) == libc::AF_INET6 as u16 {
-                        if let Ok(name) = CStr::from_ptr(ifaddr.ifa_name).to_str() {
-                            if ipv4_interfaces.contains_key(name) {
-                                let sockaddr_in6 = &*(ifaddr.ifa_addr as *const libc::sockaddr_in6);
-                                let addr_bytes: [u8; 16] = mem::transmute(sockaddr_in6.sin6_addr.s6_addr);
-                                let ipv6 = Ipv6Addr::from(addr_bytes);
-                                let ip_addr = IpAddr::V6(ipv6);
-                                
-                                // Only include link-local IPv6 addresses
-                                if !ipv6.is_loopback() && ipv6.is_unicast_link_local() {
-                                    addresses.push(ip_addr);
-                                }
+            for interface in &interfaces {
+                if ipv4_interfaces.contains_key(&interface.name) && !interface.addr.is_empty() {
+                    for addr in &interface.addr {
+                        let ip_addr = addr.ip();
+                        
+                        if let IpAddr::V6(ipv6) = ip_addr {
+                            if is_usable_ipv6(&ipv6) {
+                                addresses.push(ip_addr);
+                                debug!("Found IPv6 interface: {} ({})", interface.name, ip_addr);
                             }
                         }
                     }
                 }
-                
-                current = ifaddr.ifa_next;
             }
-
-            libc::freeifaddrs(ifaddrs_ptr);
         }
-
-        // Sort and deduplicate
-        addresses.sort();
-        addresses.dedup();
-
-        debug!("Found {} network interfaces using POSIX implementation", addresses.len());
-        addresses
-    }).await.unwrap_or_else(|e| {
-        error!("Failed to scan POSIX interfaces: {}", e);
-        Vec::new()
-    })
-}
-
-// Windows implementation using native Windows APIs
-#[cfg(target_os = "windows")]
-async fn scan_windows_interfaces() -> Vec<IpAddr> {
-    use std::collections::HashMap;
-    use std::mem;
-    use std::ptr;
-    use winapi::shared::ws2def::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6};
-    use winapi::shared::winerror::ERROR_SUCCESS;
-    use winapi::um::iphlpapi::GetAdaptersAddresses;
-    use winapi::um::iptypes::{GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES, IP_ADAPTER_UNICAST_ADDRESS};
-
-    tokio::task::spawn_blocking(|| {
-        let mut addresses = Vec::new();
-        let mut ipv4_interfaces: HashMap<String, IpAddr> = HashMap::new();
-
-        unsafe {
-            // First, get the required buffer size
-            let mut buf_len = 0u32;
-            GetAdaptersAddresses(
-                AF_INET as u32,
-                GAA_FLAG_INCLUDE_PREFIX,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut buf_len,
-            );
-
-            if buf_len == 0 {
-                error!("Failed to get adapter addresses buffer size");
-                return addresses;
-            }
-
-            // Allocate buffer and get adapter addresses
-            let mut buffer = vec![0u8; buf_len as usize];
-            let adapter_addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES;
-
-            let result = GetAdaptersAddresses(
-                AF_INET as u32,
-                GAA_FLAG_INCLUDE_PREFIX,
-                ptr::null_mut(),
-                adapter_addresses,
-                &mut buf_len,
-            );
-
-            if result != ERROR_SUCCESS {
-                error!("Failed to get adapter addresses: {}", result);
-                return addresses;
-            }
-
-            // First pass: collect IPv4 addresses
-            let mut current_adapter = adapter_addresses;
-            while !current_adapter.is_null() {
-                let adapter = &*current_adapter;
-                
-                let mut current_address = adapter.FirstUnicastAddress;
-                while !current_address.is_null() {
-                    let address = &*current_address;
-                    let sockaddr = address.Address.lpSockaddr;
-                    
-                    if (*sockaddr).sa_family == AF_INET as u16 {
-                        let sockaddr_in = &*(sockaddr as *const SOCKADDR_IN);
-                        let addr_bytes = sockaddr_in.sin_addr.S_un.S_addr().to_ne_bytes();
-                        let ipv4 = Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]);
-                        let ip_addr = IpAddr::V4(ipv4);
-                        
-                        if is_usable_interface(&ip_addr) {
-                            addresses.push(ip_addr);
-                            // Convert adapter name to string
-                            let adapter_name = std::ffi::CStr::from_ptr(adapter.AdapterName as *const i8)
-                                .to_string_lossy()
-                                .to_string();
-                            ipv4_interfaces.insert(adapter_name, ip_addr);
+        Err(e) => {
+            error!("Failed to get network interfaces using network-interface crate: {}", e);
+            
+            // Fallback to if-addrs crate for better compatibility
+            match if_addrs::get_if_addrs() {
+                Ok(interfaces) => {
+                    for interface in interfaces {
+                        let addr = interface.ip();
+                        if is_usable_interface(&addr) {
+                            addresses.push(addr);
+                            debug!("Found fallback interface: {} ({})", interface.name, addr);
                         }
                     }
-                    
-                    current_address = address.Next;
                 }
-                
-                current_adapter = adapter.Next;
-            }
-
-            // Second pass: collect IPv6 addresses for interfaces with IPv4
-            // (Similar implementation for IPv6...)
-        }
-
-        // Sort and deduplicate
-        addresses.sort();
-        addresses.dedup();
-
-        debug!("Found {} network interfaces using Windows implementation", addresses.len());
-        addresses
-    }).await.unwrap_or_else(|e| {
-        error!("Failed to scan Windows interfaces: {}", e);
-        Vec::new()
-    })
-}
-
-// Generic fallback implementation using if-addrs crate
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "windows")))]
-async fn scan_generic_interfaces() -> Vec<IpAddr> {
-    tokio::task::spawn_blocking(|| {
-        let mut addresses = Vec::new();
-
-        match if_addrs::get_if_addrs() {
-            Ok(interfaces) => {
-                for interface in interfaces {
-                    let addr = interface.ip();
-                    if is_usable_interface(&addr) {
-                        addresses.push(addr);
-                        debug!("Found interface: {} ({})", interface.name, addr);
-                    }
+                Err(e2) => {
+                    error!("Both network-interface and if-addrs failed: {} / {}", e, e2);
                 }
             }
-            Err(e) => {
-                error!("Failed to get network interfaces: {}", e);
-            }
         }
+    }
 
-        // Sort and deduplicate
-        addresses.sort();
-        addresses.dedup();
+    // Sort and deduplicate
+    addresses.sort();
+    addresses.dedup();
 
-        debug!("Found {} network interfaces using generic implementation", addresses.len());
-        addresses
-    }).await.unwrap_or_else(|e| {
-        error!("Failed to scan generic interfaces: {}", e);
-        Vec::new()
-    })
+    debug!("Found {} total network interfaces using safe implementation", addresses.len());
+    addresses
 }
 
 /// Check if an IP address represents a usable interface for Link discovery
@@ -270,15 +120,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_interface_scanning() {
+    async fn test_safe_interface_scanning() {
         let interfaces = scan_network_interfaces().await;
         // Should find at least one interface on most systems
         // Note: This might fail in containerized environments
-        println!("Found {} interfaces: {:?}", interfaces.len(), interfaces);
+        println!("Found {} interfaces using safe implementation: {:?}", interfaces.len(), interfaces);
+        
+        // Verify all returned interfaces are usable
+        for interface in &interfaces {
+            assert!(is_usable_interface(interface), "Interface {:?} should be usable", interface);
+        }
     }
 
     #[test]
-    fn test_usable_interface_detection() {
+    fn test_safe_usable_interface_detection() {
         // IPv4 tests
         assert!(!is_usable_ipv4(&Ipv4Addr::LOCALHOST)); // 127.0.0.1
         assert!(!is_usable_ipv4(&Ipv4Addr::UNSPECIFIED)); // 0.0.0.0
@@ -292,5 +147,73 @@ mod tests {
         // Link-local IPv6 should be usable
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         assert!(is_usable_ipv6(&link_local));
+    }
+
+    #[test]
+    fn test_safe_interface_filtering() {
+        // Test various IP addresses to ensure proper filtering
+        let test_addresses = vec![
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),      // Loopback - should be filtered
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),        // Unspecified - should be filtered
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),  // Private - should be kept
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),       // Private - should be kept
+            IpAddr::V6(Ipv6Addr::LOCALHOST),              // IPv6 loopback - should be filtered
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // Link-local - should be kept
+        ];
+
+        let expected_usable = vec![
+            false, // 127.0.0.1
+            false, // 0.0.0.0
+            true,  // 192.168.1.100
+            true,  // 10.0.0.1
+            false, // IPv6 ::1
+            true,  // IPv6 link-local
+        ];
+
+        for (addr, expected) in test_addresses.iter().zip(expected_usable.iter()) {
+            assert_eq!(
+                is_usable_interface(addr), 
+                *expected, 
+                "Interface {:?} usability should be {}", 
+                addr, 
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_interface_crate_availability() {
+        // Test that the network-interface crate is working
+        match network_interface::NetworkInterface::show() {
+            Ok(interfaces) => {
+                println!("network-interface crate found {} interfaces", interfaces.len());
+                // Just verify we can access the interface data safely
+                for interface in interfaces.iter().take(3) { // Limit to first 3 for testing
+                    println!("Interface: {} with {} addresses", interface.name, interface.addr.len());
+                }
+            }
+            Err(e) => {
+                println!("network-interface crate error (may be expected in some environments): {}", e);
+                // This is okay - the code will fallback to if-addrs
+            }
+        }
+    }
+
+    #[test]
+    fn test_fallback_interface_scanning() {
+        // Test the fallback if-addrs implementation
+        match if_addrs::get_if_addrs() {
+            Ok(interfaces) => {
+                println!("if-addrs fallback found {} interfaces", interfaces.len());
+                for interface in interfaces.iter().take(3) { // Limit for testing
+                    println!("Fallback interface: {} ({})", interface.name, interface.ip());
+                    // Verify we can safely access the data
+                    assert!(!interface.name.is_empty());
+                }
+            }
+            Err(e) => {
+                println!("if-addrs error (may be expected in some environments): {}", e);
+            }
+        }
     }
 }

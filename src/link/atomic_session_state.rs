@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::{
     state::ClientState,
-    rt_session_state::RtSessionStateHandler,
+    safe_rt_session_state::SafeRtSessionStateHandler,
 };
 
 #[cfg(test)]
@@ -20,8 +20,8 @@ use crate::link::IncomingClientState;
 /// Atomic session state that provides lock-free access for real-time threads
 /// This mirrors the C++ Link implementation's clientStateRtSafe() mechanism
 pub struct AtomicSessionState {
-    /// Real-time session state handler for lock-free access
-    rt_handler: Arc<RtSessionStateHandler>,
+    /// Real-time session state handler for lock-free access (now using safe implementation)
+    rt_handler: Arc<SafeRtSessionStateHandler>,
     
     /// Enable state for determining if we should respect remote updates
     is_enabled: AtomicBool,
@@ -33,7 +33,7 @@ pub struct AtomicSessionState {
 impl AtomicSessionState {
     pub fn new(initial_state: ClientState, grace_period: Duration) -> Self {
         Self {
-            rt_handler: Arc::new(RtSessionStateHandler::new(initial_state, grace_period)),
+            rt_handler: Arc::new(SafeRtSessionStateHandler::new(initial_state, grace_period)),
             is_enabled: AtomicBool::new(false),
             peer_count: AtomicU64::new(0),
         }

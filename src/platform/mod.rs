@@ -1,22 +1,16 @@
 // Platform-specific optimizations and implementations
 // Based on the C++ implementation's platform abstractions
+// Now using 100% safe Rust implementations!
 
 pub mod clock;
 pub mod network;
 pub mod thread;
 
-// Re-export platform-specific types based on current platform
-#[cfg(target_os = "macos")]
-pub use clock::DarwinClock as PlatformClock;
+// Re-export the safe OptimizedClock for all platforms
+pub use clock::OptimizedClock as PlatformClock;
 
-#[cfg(target_os = "linux")]
-pub use clock::LinuxClock as PlatformClock;
-
-#[cfg(target_os = "windows")]
-pub use clock::WindowsClock as PlatformClock;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub use clock::GenericClock as PlatformClock;
+// Also export the safe clock for direct usage
+pub use clock::SafeClock;
 
 // Thread factory
 pub use thread::ThreadFactory;

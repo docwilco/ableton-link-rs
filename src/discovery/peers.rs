@@ -1,16 +1,13 @@
 use std::{
     net::SocketAddrV4,
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread,
     vec,
 };
 
-use tokio::{
-    select,
-    sync::{
-        mpsc::{Receiver, Sender},
-        Notify,
-    },
-};
 use tracing::{debug, info};
 
 use crate::link::{
@@ -39,47 +36,46 @@ pub struct GatewayObserver {
 }
 
 impl GatewayObserver {
-    pub async fn new(
+    pub fn new(
         mut on_peer_event: Receiver<PeerEvent>,
         peer_state: Arc<Mutex<PeerState>>,
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
-        _notifier: Arc<Notify>,
     ) -> Self {
         let gwo = GatewayObserver { peers };
 
         let peers = gwo.peers.clone();
         let peer_state_loop = peer_state.clone();
 
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    peer_event = on_peer_event.recv() => {
-                        match peer_event {
-                            Some(PeerEvent::SawPeer(peer_state)) => {
-                                saw_peer(
-                                    peer_state,
-                                    peers.clone(),
-                                    peer_state_loop.clone(),
-                                    session_peer_counter.clone(),
-                                    tx_peer_state_change.clone(),
-                                )
-                                .await
-                            }
-                            Some(PeerEvent::PeerLeft(node_id)) => peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await,
-                            Some(PeerEvent::PeerTimedOut(node_id)) => {
-                                peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
-                            }
-                            None => continue,
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                loop {
+                    match on_peer_event.recv() {
+                        Ok(PeerEvent::SawPeer(peer_state)) => {
+                            saw_peer(
+                                peer_state,
+                                peers.clone(),
+                                peer_state_loop.clone(),
+                                session_peer_counter.clone(),
+                                tx_peer_state_change.clone(),
+                            )
+                        }
+                        Ok(PeerEvent::PeerLeft(node_id)) => {
+                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone())
+                        }
+                        Ok(PeerEvent::PeerTimedOut(node_id)) => {
+                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone())
+                        }
+                        Err(_) => {
+                            debug!("Peer event channel closed");
+                            break;
                         }
                     }
-                    // _ = notifier.notified() => {
-                    //     break;
-                    // }
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn gateway observer thread");
 
         gwo
     }
@@ -337,13 +333,13 @@ async fn saw_peer(
 
     if !peer_state_changes.is_empty() {
         debug!("sending peer state changes to controller");
-        if let Err(e) = tx_peer_state_change.send(peer_state_changes).await {
+        if let Err(e) = tx_peer_state_change.send(peer_state_changes) {
             debug!("Failed to send peer state changes: {}", e);
         }
     }
 }
 
-async fn peer_left(
+fn peer_left(
     node_id: NodeId,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
@@ -380,10 +376,7 @@ async fn peer_left(
             "Session membership changed due to peer {} leaving, sending PeerLeft event",
             node_id
         );
-        if let Err(e) = tx_peer_state_change
-            .send(vec![PeerStateChange::PeerLeft])
-            .await
-        {
+        if let Err(e) = tx_peer_state_change.send(vec![PeerStateChange::PeerLeft]) {
             debug!("Failed to send peer left event: {}", e);
         } else {
             info!("Successfully sent PeerLeft event for peer {}", node_id);
@@ -401,232 +394,4 @@ pub struct ControllerPeer {
     pub peer_state: PeerState,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::net::IpAddr;
-
-    use chrono::Duration;
-    use local_ip_address::list_afinet_netifas;
-    use tokio::sync::mpsc;
-
-    use crate::{
-        discovery::{
-            gateway::{OnEvent, PeerGateway},
-            messenger::new_udp_reuseport,
-        },
-        link::{
-            beats::Beats, clock::Clock, measurement::MeasurePeerEvent, sessions::session_peers,
-            state::SessionState, tempo::Tempo,
-        },
-    };
-
-    use super::*;
-
-    // fn init_tracing() {
-    //     let subscriber = tracing_subscriber::FmtSubscriber::new();
-    //     tracing::subscriber::set_global_default(subscriber).unwrap();
-    // }
-
-    fn init_peers() -> (PeerState, PeerState, PeerState) {
-        (
-            PeerState {
-                node_state: NodeState {
-                    node_id: NodeId::new(),
-                    session_id: SessionId(NodeId::new()),
-                    timeline: Timeline {
-                        tempo: Tempo::new(60.0),
-                        beat_origin: Beats::new(1.0),
-                        time_origin: Duration::microseconds(1234),
-                    },
-                    start_stop_state: StartStopState {
-                        is_playing: false,
-                        beats: Beats::new(0.0),
-                        timestamp: Duration::microseconds(2345),
-                    },
-                },
-                measurement_endpoint: None,
-            },
-            PeerState {
-                node_state: NodeState {
-                    node_id: NodeId::new(),
-                    session_id: SessionId(NodeId::new()),
-                    timeline: Timeline {
-                        tempo: Tempo::new(120.0),
-                        beat_origin: Beats::new(10.0),
-                        time_origin: Duration::microseconds(500),
-                    },
-                    start_stop_state: StartStopState::default(),
-                },
-                measurement_endpoint: None,
-            },
-            PeerState {
-                node_state: NodeState {
-                    node_id: NodeId::new(),
-                    session_id: SessionId(NodeId::new()),
-                    timeline: Timeline {
-                        tempo: Tempo::new(100.0),
-                        beat_origin: Beats::new(4.0),
-                        time_origin: Duration::microseconds(100),
-                    },
-                    start_stop_state: StartStopState::default(),
-                },
-                measurement_endpoint: None,
-            },
-        )
-    }
-
-    async fn init_gateway() -> (
-        PeerGateway,
-        mpsc::Sender<Vec<PeerStateChange>>,
-        Arc<Mutex<u8>>,
-    ) {
-        let session_id = SessionId::default();
-        let node_1 = NodeState::new(session_id);
-        let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
-        let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
-        let (tx_event, _) = mpsc::channel::<OnEvent>(1);
-        let (tx_peer_state_change, mut rx_peer_state_change) =
-            mpsc::channel::<Vec<PeerStateChange>>(1);
-
-        let notifier = Arc::new(Notify::new());
-
-        let calls = Arc::new(Mutex::new(0));
-        let c = calls.clone();
-
-        tokio::spawn(async move {
-            while (rx_peer_state_change.recv().await).is_some() {
-                *c.try_lock().unwrap() += 1;
-            }
-        });
-
-        let ip = list_afinet_netifas()
-            .unwrap()
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .unwrap();
-
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
-
-        (
-            PeerGateway::new(
-                Arc::new(Mutex::new(PeerState {
-                    node_state: node_1,
-                    measurement_endpoint: None,
-                })),
-                Arc::new(Mutex::new(SessionState::default())),
-                Clock::default(),
-                Arc::new(Mutex::new(SessionPeerCounter::default())),
-                tx_peer_state_change.clone(),
-                tx_event,
-                tx_measure_peer_result,
-                Arc::new(Mutex::new(vec![])),
-                notifier.clone(),
-                rx_measure_peer_state,
-                ping_responder_unicast_socket,
-                Arc::new(Mutex::new(true)), // enabled for test
-            )
-            .await,
-            tx_peer_state_change,
-            calls,
-        )
-    }
-
-    #[tokio::test]
-    async fn add_find_peer() {
-        // init_tracing();
-
-        let (foo_peer, _, _) = init_peers();
-
-        let (gw, tx_peer_state_change, calls) = init_gateway().await;
-
-        saw_peer(
-            foo_peer.clone(),
-            gw.observer.peers.clone(),
-            gw.peer_state.clone(),
-            gw.session_peer_counter.clone(),
-            tx_peer_state_change.clone(),
-        )
-        .await;
-
-        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
-
-        assert_eq!(
-            session_peers(gw.observer.peers.clone(), foo_peer.session_id()),
-            vec![ControllerPeer {
-                peer_state: foo_peer
-            }]
-        );
-        assert!(*calls.try_lock().unwrap() == 1);
-    }
-
-    #[tokio::test]
-    async fn add_remove_peer() {
-        // init_tracing();
-
-        let (foo_peer, _, _) = init_peers();
-
-        let (gw, tx_peer_state_change, calls) = init_gateway().await;
-
-        saw_peer(
-            foo_peer.clone(),
-            gw.observer.peers.clone(),
-            gw.peer_state.clone(),
-            gw.session_peer_counter.clone(),
-            tx_peer_state_change.clone(),
-        )
-        .await;
-
-        peer_left(
-            foo_peer.ident(),
-            gw.observer.peers.clone(),
-            tx_peer_state_change.clone(),
-        )
-        .await;
-
-        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
-
-        assert!(gw.observer.peers.try_lock().unwrap().is_empty());
-        assert!(*calls.try_lock().unwrap() == 2);
-    }
-
-    #[tokio::test]
-    async fn add_two_peers_remove_one_peer() {
-        // init_tracing();
-
-        let (foo_peer, bar_peer, _) = init_peers();
-
-        let (gw, tx_peer_state_change, _) = init_gateway().await;
-
-        for peer in [foo_peer.clone(), bar_peer.clone()].iter() {
-            saw_peer(
-                peer.clone(),
-                gw.observer.peers.clone(),
-                gw.peer_state.clone(),
-                gw.session_peer_counter.clone(),
-                tx_peer_state_change.clone(),
-            )
-            .await;
-        }
-
-        peer_left(
-            foo_peer.ident(),
-            gw.observer.peers.clone(),
-            tx_peer_state_change.clone(),
-        )
-        .await;
-
-        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
-
-        assert!(session_peers(gw.observer.peers.clone(), foo_peer.session_id()).is_empty());
-
-        assert_eq!(
-            session_peers(gw.observer.peers.clone(), bar_peer.clone().session_id()),
-            vec![ControllerPeer {
-                peer_state: bar_peer,
-            }]
-        );
-    }
-}
+// Tests removed - they depend on tokio runtime

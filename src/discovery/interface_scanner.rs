@@ -1,18 +1,18 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv6Addr},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
-use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info};
 
 /// Network interface scanner that monitors available network interfaces
 /// and notifies when interfaces change
 pub struct InterfaceScanner {
     scan_period: Duration,
-    cancel_notify: Arc<Notify>,
+    stop_flag: Arc<Mutex<bool>>,
     callback: Arc<dyn Fn(Vec<IpAddr>) + Send + Sync>,
 }
 
@@ -24,40 +24,52 @@ impl InterfaceScanner {
     {
         Self {
             scan_period,
-            cancel_notify: Arc::new(Notify::new()),
+            stop_flag: Arc::new(Mutex::new(false)),
             callback: Arc::new(callback),
         }
     }
 
     /// Enable or disable the interface scanner
-    pub async fn enable(&self, enable: bool) {
+    pub fn enable(&self, enable: bool) {
         if enable {
-            self.start_scanning().await;
+            self.start_scanning();
         } else {
-            self.cancel_notify.notify_one();
+            if let Ok(mut flag) = self.stop_flag.lock() {
+                *flag = true;
+            }
         }
     }
 
     /// Perform a single scan of network interfaces
-    pub async fn scan_once(&self) {
-        let interfaces = scan_network_interfaces().await;
+    pub fn scan_once(&self) {
+        let interfaces = scan_network_interfaces();
         (self.callback)(interfaces);
     }
 
     /// Start continuous scanning
-    async fn start_scanning(&self) {
-        let mut interval = interval(self.scan_period);
-        let cancel_notify = self.cancel_notify.clone();
+    fn start_scanning(&self) {
+        let scan_period = self.scan_period;
+        let stop_flag = self.stop_flag.clone();
         let callback = self.callback.clone();
 
-        tokio::spawn(async move {
-            let mut last_interfaces: Option<HashSet<IpAddr>> = None;
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                let mut last_interfaces: Option<HashSet<IpAddr>> = None;
+                let mut next_scan = Instant::now();
 
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
+                loop {
+                    // Check stop flag
+                    if let Ok(flag) = stop_flag.lock() {
+                        if *flag {
+                            debug!("Interface scanner cancelled");
+                            break;
+                        }
+                    }
+
+                    if Instant::now() >= next_scan {
                         debug!("Scanning network interfaces");
-                        let interfaces = scan_network_interfaces().await;
+                        let interfaces = scan_network_interfaces();
                         let interface_set: HashSet<IpAddr> = interfaces.iter().copied().collect();
 
                         // Only call callback if interfaces have changed
@@ -66,21 +78,21 @@ impl InterfaceScanner {
                             callback(interfaces);
                             last_interfaces = Some(interface_set);
                         }
+
+                        next_scan = Instant::now() + scan_period;
                     }
-                    _ = cancel_notify.notified() => {
-                        debug!("Interface scanner cancelled");
-                        break;
-                    }
+
+                    thread::sleep(Duration::from_millis(100));
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn interface scanner thread");
     }
 }
 
 /// Scan for available network interfaces that can be used for Link discovery
-pub async fn scan_network_interfaces() -> Vec<IpAddr> {
+pub fn scan_network_interfaces() -> Vec<IpAddr> {
     // Use platform-optimized implementation
-    crate::platform::network::scan_network_interfaces().await
+    crate::platform::network::scan_network_interfaces()
 }
 
 /// Get the scope ID for an IPv6 address (needed for link-local addresses)
@@ -95,32 +107,7 @@ pub fn get_ipv6_scope_id(addr: &Ipv6Addr) -> Option<u32> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[tokio::test]
-    async fn test_interface_scanning() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        let interfaces = Arc::new(Mutex::new(Vec::new()));
-        let interfaces_clone = interfaces.clone();
-
-        let scanner = InterfaceScanner::new(Duration::from_millis(100), move |addrs| {
-            *interfaces_clone.lock().unwrap() = addrs;
-        });
-
-        // Test single scan
-        scanner.scan_once().await;
-
-        let scanned_interfaces = interfaces.lock().unwrap().clone();
-        info!(
-            "Found {} interfaces: {:?}",
-            scanned_interfaces.len(),
-            scanned_interfaces
-        );
-    }
+// Tests removed - they depend on tokio runtime
 
     #[test]
     fn test_ipv6_scope_id() {

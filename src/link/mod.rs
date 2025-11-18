@@ -224,7 +224,7 @@ impl BasicLink {
         };
 
         // Update the controller state
-        self.controller.set_state(incoming_state).await;
+        self.controller.set_state(incoming_state);
 
         // Invoke start/stop callback if needed
         if should_invoke_callback {

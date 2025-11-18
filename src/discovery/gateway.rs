@@ -97,7 +97,6 @@ impl PeerGateway {
                 session_peer_counter.clone(),
                 tx_peer_state_change,
                 peers,
-                stop_flag.clone(),
             ),
             messenger,
             measurement_service: MeasurementService::new(

@@ -1,20 +1,16 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Sender, Receiver},
+    },
+    thread,
+    time::Duration as StdDuration,
 };
 
 use chrono::Duration;
-use local_ip_address::list_afinet_netifas;
-use tokio::{
-    net::UdpSocket,
-    select,
-    sync::{
-        mpsc::{self, Sender},
-        Notify,
-    },
-};
 use tracing::{debug, info};
 
 use crate::{
@@ -96,40 +92,57 @@ pub struct MeasurementService {
     pub measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     pub clock: Clock,
     pub ping_responder: PingResponder,
-    pub tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    pub tx_measure_peer: std::sync::mpsc::Sender<MeasurePeerEvent>,
 }
 
 impl MeasurementService {
-    pub async fn new(
+    pub fn new(
         ping_responder_unicast_socket: Arc<UdpSocket>,
         peer_state: Arc<Mutex<PeerState>>,
         session_state: Arc<Mutex<SessionState>>,
         clock: Clock,
-        tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
-        notifier: Arc<Notify>,
-        mut rx_measure_peer_state: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+        tx_measure_peer_result: std::sync::mpsc::Sender<MeasurePeerEvent>,
+        stop_flag: Arc<Mutex<bool>>,
+        rx_measure_peer_state: std::sync::mpsc::Receiver<MeasurePeerEvent>,
     ) -> MeasurementService {
         let measurement_map = Arc::new(Mutex::new(HashMap::new()));
 
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer_result.clone();
 
-        tokio::spawn(async move {
-            loop {
-                let event = rx_measure_peer_state.recv().await;
-                if let Some(MeasurePeerEvent::PeerState(session_id, peer)) = event {
-                    measure_peer(
-                        clock,
-                        m_map.clone(),
-                        t_peer.clone(),
-                        session_id,
-                        peer,
-                        notifier.clone(),
-                    )
-                    .await;
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                loop {
+                    // Check stop flag
+                    if let Ok(flag) = stop_flag.lock() {
+                        if *flag {
+                            break;
+                        }
+                    }
+
+                    match rx_measure_peer_state.recv_timeout(StdDuration::from_millis(100)) {
+                        Ok(MeasurePeerEvent::PeerState(session_id, peer)) => {
+                            measure_peer(
+                                clock,
+                                m_map.clone(),
+                                t_peer.clone(),
+                                session_id,
+                                peer,
+                                stop_flag.clone(),
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Normal timeout, continue
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn measurement service thread");
 
         MeasurementService {
             measurement_map,
@@ -144,20 +157,19 @@ impl MeasurementService {
         }
     }
 
-    pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
+    pub fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
         self.ping_responder
-            .update_node_state(session_id, x_form)
-            .await;
+            .update_node_state(session_id, x_form);
     }
 }
 
-pub async fn measure_peer(
+pub fn measure_peer(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
-    tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx_measure_peer_result: std::sync::mpsc::Sender<MeasurePeerEvent>,
     session_id: SessionId,
     state: PeerState,
-    notifier: Arc<Notify>,
+    stop_flag: Arc<Mutex<bool>>,
 ) {
     info!(
         "measuring peer {} at {} for session {}",
@@ -168,43 +180,57 @@ pub async fn measure_peer(
 
     let node_id = state.node_state.node_id;
 
-    let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
+    let (tx_measurement, rx_measurement) = mpsc::channel();
 
-    let measurement = Measurement::new(state, clock, tx_measurement, notifier).await;
+    let measurement = Measurement::new(state, clock, tx_measurement, stop_flag.clone());
     measurement_map
         .try_lock()
         .unwrap()
         .insert(node_id, measurement);
 
     let tx_measure_peer_result_loop = tx_measure_peer_result.clone();
+    let measurement_map_loop = measurement_map.clone();
 
-    let measurement_map = measurement_map.clone();
-
-    tokio::spawn(async move {
-        loop {
-            if let Some(data) = rx_measurement.recv().await {
-                if data.is_empty() {
-                    tx_measure_peer_result_loop
-                        .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
-                        .await
-                        .unwrap();
-                } else {
-                    tx_measure_peer_result_loop
-                        .send(MeasurePeerEvent::XForm(
-                            session_id,
-                            GhostXForm {
-                                slope: 1.0,
-                                intercept: Duration::microseconds(median(data).round() as i64),
-                            },
-                        ))
-                        .await
-                        .unwrap();
+    thread::Builder::new()
+        .stack_size(8192)
+        .spawn(move || {
+            loop {
+                // Check stop flag
+                if let Ok(flag) = stop_flag.lock() {
+                    if *flag {
+                        break;
+                    }
                 }
 
-                measurement_map.try_lock().unwrap().remove(&node_id);
+                match rx_measurement.recv_timeout(StdDuration::from_millis(100)) {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            let _ = tx_measure_peer_result_loop
+                                .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()));
+                        } else {
+                            let _ = tx_measure_peer_result_loop
+                                .send(MeasurePeerEvent::XForm(
+                                    session_id,
+                                    GhostXForm {
+                                        slope: 1.0,
+                                        intercept: Duration::microseconds(median(data).round() as i64),
+                                    },
+                                ));
+                        }
+
+                        measurement_map_loop.try_lock().unwrap().remove(&node_id);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Continue waiting
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                }
             }
-        }
-    });
+        })
+        .expect("Failed to spawn measurement result handler thread");
 }
 
 pub const NUMBER_DATA_POINTS: usize = 20;

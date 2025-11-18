@@ -214,7 +214,7 @@ pub enum PeerStateChange {
     PeerLeft,
 }
 
-async fn saw_peer(
+fn saw_peer(
     peer_seen_peer_state: PeerState,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_peer_state: Arc<Mutex<PeerState>>,

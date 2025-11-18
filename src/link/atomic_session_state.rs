@@ -2,7 +2,8 @@
 // Based on C++ Link's atomic and lock-free mechanisms
 
 use chrono::Duration;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 
 use super::{

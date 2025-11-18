@@ -1,5 +1,6 @@
 use chrono::Duration;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use triple_buffer::{Input, Output, TripleBuffer};
 

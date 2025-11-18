@@ -107,7 +107,9 @@ pub fn get_ipv6_scope_id(addr: &Ipv6Addr) -> Option<u32> {
     }
 }
 
-// Tests removed - they depend on tokio runtime
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn test_ipv6_scope_id() {

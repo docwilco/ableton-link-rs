@@ -1,8 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::UdpSocket,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use bincode::{Decode, Encode};
 
-use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, info};
 
 use crate::{
@@ -60,7 +63,7 @@ impl PingResponder {
         }
     }
 
-    pub async fn listen(&self, _notifier: Arc<Notify>) {
+    pub fn listen(&self) {
         let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
         let session_id = self.session_id.clone();
         let ghost_x_form = self.ghost_x_form.clone();
@@ -71,13 +74,14 @@ impl PingResponder {
             unicast_socket.local_addr().unwrap()
         );
 
-        let mut ping_message_received = false;
-
-        tokio::spawn(async move {
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+            let mut ping_message_received = false;
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                if let Ok((amt, src)) = unicast_socket.recv_from(&mut buf).await {
+                if let Ok((amt, src)) = unicast_socket.recv_from(&mut buf) {
                     if !buf.starts_with(&PROTOCOL_HEADER) {
                         info!("protocol header mismatch");
                         continue;
@@ -126,7 +130,7 @@ impl PingResponder {
                         }
 
                         let pong_message = encode_message(PONG, &pong_payload).unwrap();
-                        unicast_socket.send_to(&pong_message, src).await.unwrap();
+                        let _ = unicast_socket.send_to(&pong_message, src);
                         if !ping_message_received {
                             debug!("sent pong message to {}", src);
                         }
@@ -137,10 +141,11 @@ impl PingResponder {
                     }
                 }
             }
-        });
+        })
+        .expect("Failed to spawn ping responder thread");
     }
 
-    pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
+    pub fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
         *self.session_id.try_lock().unwrap() = session_id;
         *self.ghost_x_form.try_lock().unwrap() = x_form;
     }
@@ -186,22 +191,14 @@ mod tests {
 
     use super::*;
 
-    fn init_tracing() {
-        let _ = tracing_subscriber::fmt::try_init();
-    }
-
     #[test]
     fn roundtrip() {
-        init_tracing();
-
         let payload = Payload {
             entries: vec![PayloadEntry::HostTime(HostTime::default())],
         };
 
         let message = encode_message(PING, &payload).unwrap();
-        info!("message: {:?}", message);
-
         let header = parse_message_header(&message).unwrap();
-        info!("header: {:?}", header);
+        assert_eq!(header.0.message_type, PING);
     }
 }

@@ -1,12 +1,16 @@
 use std::{
     fmt::{self, Display},
     mem,
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration as StdDuration,
 };
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tokio::{sync::Notify};
 use tracing::{debug, info};
 
 use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
@@ -81,69 +85,79 @@ pub struct Sessions {
     pub other_sessions: Arc<Mutex<Vec<Session>>>,
     pub current: Arc<Mutex<Session>>,
     pub is_founding: Arc<Mutex<bool>>,
-    pub tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    pub tx_measure_peer_state: Sender<MeasurePeerEvent>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
     pub clock: Clock,
     pub has_joined: Arc<Mutex<bool>>,
+    stop_flag: Arc<Mutex<bool>>,
 }
 
 impl Sessions {
     pub fn new(
         init: Session,
-        tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+        tx_measure_peer_state: Sender<MeasurePeerEvent>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         clock: Clock,
-        tx_join_session: tokio::sync::mpsc::Sender<Session>,
-        notifier: Arc<Notify>,
-        mut rx_measure_peer_result: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+        tx_join_session: Sender<Session>,
+        mut rx_measure_peer_result: Receiver<MeasurePeerEvent>,
     ) -> Self {
         let other_sessions = Arc::new(Mutex::new(vec![init.clone()]));
         let current = Arc::new(Mutex::new(init));
+        let stop_flag = Arc::new(Mutex::new(false));
 
         let other_sessions_loop = other_sessions.clone();
         let current_loop = current.clone();
         let tx_join_session_loop = tx_join_session.clone();
         let peers_loop = peers.clone();
         let tx_measure_peer_state_loop = tx_measure_peer_state.clone();
+        let stop_flag_loop = stop_flag.clone();
 
-        let jh = tokio::spawn(async move {
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
             loop {
-                if let Some(MeasurePeerEvent::XForm(session_id, x_form)) =
-                    rx_measure_peer_result.recv().await
-                {
-                    if x_form == GhostXForm::default() {
-                        handle_failed_measurement(
-                            session_id,
-                            other_sessions_loop.clone(),
-                            current_loop.clone(),
-                            peers_loop.clone(),
-                            tx_measure_peer_state_loop.clone(),
-                        )
-                        .await;
-                    } else {
-                        handle_successful_measurement(
-                            session_id,
-                            x_form,
-                            other_sessions_loop.clone(),
-                            current_loop.clone(),
-                            clock,
-                            tx_join_session_loop.clone(),
-                            peers_loop.clone(),
-                            tx_measure_peer_state_loop.clone(),
-                        )
-                        .await;
+                // Check stop flag
+                if let Ok(flag) = stop_flag_loop.lock() {
+                    if *flag {
+                        break;
                     }
-                } else {
-                    info!("measure peer event channel closed");
+                }
+
+                match rx_measure_peer_result.recv_timeout(StdDuration::from_millis(100)) {
+                    Ok(MeasurePeerEvent::XForm(session_id, x_form)) => {
+                        if x_form == GhostXForm::default() {
+                            handle_failed_measurement(
+                                session_id,
+                                other_sessions_loop.clone(),
+                                current_loop.clone(),
+                                peers_loop.clone(),
+                                tx_measure_peer_state_loop.clone(),
+                            );
+                        } else {
+                            handle_successful_measurement(
+                                session_id,
+                                x_form,
+                                other_sessions_loop.clone(),
+                                current_loop.clone(),
+                                clock,
+                                tx_join_session_loop.clone(),
+                                peers_loop.clone(),
+                                tx_measure_peer_state_loop.clone(),
+                            );
+                        }
+                    }
+                    Ok(_) => {} // Other event types
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Timeout is normal, continue loop
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("measure peer event channel closed");
+                        break;
+                    }
                 }
             }
-        });
-
-        tokio::spawn(async move {
-            notifier.notified().await;
-
-            jh.abort();
-        });
+        })
+        .expect("Failed to spawn sessions measurement thread");
 
         Self {
             other_sessions,
@@ -153,6 +167,7 @@ impl Sessions {
             clock,
             is_founding: Arc::new(Mutex::new(false)),
             has_joined: Arc::new(Mutex::new(false)),
+            stop_flag,
         }
     }
 
@@ -173,7 +188,7 @@ impl Sessions {
         }
     }
 
-    pub async fn saw_session_timeline(
+    pub fn saw_session_timeline(
         &self,
         session_id: SessionId,
         timeline: Timeline,
@@ -231,8 +246,7 @@ impl Sessions {
                     self.peers.clone(),
                     self.tx_measure_peer_state.clone(),
                     session,
-                )
-                .await;
+                );
             }
         }
 
@@ -261,9 +275,17 @@ impl Sessions {
     }
 }
 
-pub async fn launch_session_measurement(
+impl Drop for Sessions {
+    fn drop(&mut self) {
+        if let Ok(mut flag) = self.stop_flag.lock() {
+            *flag = true;
+        }
+    }
+}
+
+pub fn launch_session_measurement(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx_measure_peer_state: Sender<MeasurePeerEvent>,
     mut session: Session,
 ) {
     info!(
@@ -278,26 +300,20 @@ pub async fn launch_session_measurement(
         .find(|p| p.peer_state.ident() == session.session_id.0)
     {
         session.measurement.timestamp = Duration::zero();
-        tx_measure_peer_state
-            .send(MeasurePeerEvent::PeerState(
-                session.session_id,
-                p.peer_state.clone(),
-            ))
-            .await
-            .unwrap();
+        let _ = tx_measure_peer_state.send(MeasurePeerEvent::PeerState(
+            session.session_id,
+            p.peer_state.clone(),
+        ));
     } else if let Some(p) = peers.first() {
         session.measurement.timestamp = Duration::zero();
-        tx_measure_peer_state
-            .send(MeasurePeerEvent::PeerState(
-                session.session_id,
-                p.peer_state.clone(),
-            ))
-            .await
-            .unwrap();
+        let _ = tx_measure_peer_state.send(MeasurePeerEvent::PeerState(
+            session.session_id,
+            p.peer_state.clone(),
+        ));
     }
 }
 
-pub async fn handle_successful_measurement(
+pub fn handle_successful_measurement(
     session_id: SessionId,
     x_form: GhostXForm,
     other_sessions: Arc<Mutex<Vec<Session>>>,
@@ -325,7 +341,7 @@ pub async fn handle_successful_measurement(
     if current_session_id == session_id {
         current.try_lock().unwrap().measurement = measurement;
         let session = current.try_lock().unwrap().clone();
-        if let Err(e) = tx_join_session.send(session).await {
+        if let Err(e) = tx_join_session.send(session) {
             debug!("Failed to send session join event: {}", e);
         }
     } else {
@@ -388,11 +404,11 @@ pub async fn handle_successful_measurement(
                 other_sessions.try_lock().unwrap().remove(idx);
                 other_sessions.try_lock().unwrap().insert(idx, c);
 
-                if let Err(e) = tx_join_session.send(s.clone()).await {
+                if let Err(e) = tx_join_session.send(s.clone()) {
                     debug!("Failed to send session join event: {}", e);
                 }
 
-                schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s).await;
+                schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s);
             } else {
                 debug!("Session {} does not win over current session (ghost_diff={} us, just_started={}), staying with current", 
                        session_id, 
@@ -403,18 +419,18 @@ pub async fn handle_successful_measurement(
     }
 }
 
-pub async fn handle_failed_measurement(
+pub fn handle_failed_measurement(
     session_id: SessionId,
     other_sessions: Arc<Mutex<Vec<Session>>>,
     current: Arc<Mutex<Session>>,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx_measure_peer: Sender<MeasurePeerEvent>,
 ) {
     info!("session {} measurement failed", session_id);
 
     if current.try_lock().unwrap().session_id == session_id {
         let current = current.try_lock().unwrap().clone();
-        schedule_remeasurement(peers, tx_measure_peer, current).await;
+        schedule_remeasurement(peers, tx_measure_peer, current);
     } else {
         let s = other_sessions
             .try_lock()
@@ -443,18 +459,20 @@ pub async fn handle_failed_measurement(
     }
 }
 
-pub async fn schedule_remeasurement(
+pub fn schedule_remeasurement(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx_measure_peer: Sender<MeasurePeerEvent>,
     session: Session,
 ) {
-    tokio::spawn(async move {
+    thread::Builder::new()
+        .stack_size(8192)
+        .spawn(move || {
         loop {
-            tokio::time::sleep(Duration::microseconds(30000000).to_std().unwrap()).await;
-            launch_session_measurement(peers.clone(), tx_measure_peer.clone(), session.clone())
-                .await;
+            thread::sleep(StdDuration::from_secs(30));
+            launch_session_measurement(peers.clone(), tx_measure_peer.clone(), session.clone());
         }
-    });
+    })
+    .expect("Failed to spawn remeasurement thread");
 }
 
 pub fn session_peers(

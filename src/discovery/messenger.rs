@@ -1,15 +1,13 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
-    time::Duration,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    sync::{
+        mpsc::Sender,
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+    thread,
 };
 
-use tokio::{
-    net::UdpSocket,
-    select,
-    sync::{mpsc::Sender, Notify},
-    time::Instant,
-};
 use tracing::{debug, info};
 
 use crate::{
@@ -53,12 +51,16 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
         tracing::debug!("Note: SO_REUSEPORT not set (using safe implementation)");
     }
 
-    udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
     
-    // Convert to std::net::UdpSocket and then to tokio::net::UdpSocket
+    // Convert to std::net::UdpSocket
     let std_socket: std::net::UdpSocket = udp_sock.into();
-    std_socket.try_into()
+    
+    // Set read timeout to prevent blocking forever
+    std_socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    std_socket.set_write_timeout(Some(Duration::from_millis(100)))?;
+    
+    Ok(std_socket)
 }
 
 pub struct Messenger {
@@ -68,7 +70,7 @@ pub struct Messenger {
     pub ttl_ratio: u8,
     pub last_broadcast_time: Arc<Mutex<Instant>>,
     pub tx_event: Sender<OnEvent>,
-    pub notifier: Arc<Notify>,
+    pub stop_flag: Arc<Mutex<bool>>,
     pub enabled: Arc<Mutex<bool>>,
 }
 
@@ -77,12 +79,12 @@ impl Messenger {
         peer_state: Arc<Mutex<PeerState>>,
         tx_event: Sender<OnEvent>,
         epoch: Instant,
-        notifier: Arc<Notify>,
+        stop_flag: Arc<Mutex<bool>>,
         enabled: Arc<Mutex<bool>>,
     ) -> Self {
         let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
         socket
-            .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
+            .join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::new(0, 0, 0, 0))
             .unwrap();
         socket.set_multicast_loop_v4(true).unwrap();
 
@@ -93,101 +95,131 @@ impl Messenger {
             ttl_ratio: 20,
             last_broadcast_time: Arc::new(Mutex::new(epoch)),
             tx_event,
-            notifier,
+            stop_flag,
             enabled,
         }
     }
 
-    pub async fn listen(&self) {
+    pub fn listen(&self) {
         let socket = self.interface.as_ref().unwrap().clone();
         let peer_state = self.peer_state.clone();
         let ttl = self.ttl;
         let tx_event = self.tx_event.clone();
         let last_broadcast_time = self.last_broadcast_time.clone();
         let enabled = self.enabled.clone();
+        let stop_flag = self.stop_flag.clone();
 
-        let _n = self.notifier.clone();
-
-        tokio::spawn(async move {
-            loop {
+        // Spawn listener thread with 8KB stack
+        thread::Builder::new()
+            .stack_size(8192)
+            .name("link-listener".to_string())
+            .spawn(move || {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
-                let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
+                loop {
+                    // Check stop flag
+                    if let Ok(should_stop) = stop_flag.try_lock() {
+                        if *should_stop {
+                            break;
+                        }
+                    }
 
-                // TODO figure out how to encode group ID
-                let should_ignore = match peer_state.try_lock() {
-                    Ok(guard) => header.ident == guard.ident() && header.group_id == 0,
-                    Err(_) => false, // If we can't get the lock, don't ignore
-                };
+                    // recv_from with timeout (100ms set in socket creation)
+                    let recv_result = socket.recv_from(&mut buf);
+                    
+                    let (amt, src) = match recv_result {
+                        Ok(result) => result,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                                   || e.kind() == std::io::ErrorKind::TimedOut => {
+                            // Timeout, continue loop to check stop flag
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Error receiving message: {:?}", e);
+                            continue;
+                        }
+                    };
 
-                if should_ignore {
-                    debug!("ignoring messages from self (peer {})", header.ident);
-                    continue;
-                } else {
-                    debug!(
-                        "received message type {} from peer {} at {}",
-                        MESSAGE_TYPES[header.message_type as usize], header.ident, src
-                    );
-                }
+                    let parse_result = parse_message_header(&buf[..amt]);
+                    let (header, header_len) = match parse_result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            debug!("Error parsing message header: {:?}", e);
+                            continue;
+                        }
+                    };
 
-                // Check if Link is enabled before processing ALIVE and RESPONSE messages
-                // BYEBYE messages should still be processed even when disabled to properly clean up peers
-                let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
-                    *enabled_guard
-                } else {
-                    false
-                };
+                    // TODO figure out how to encode group ID
+                    let should_ignore = match peer_state.try_lock() {
+                        Ok(guard) => header.ident == guard.ident() && header.group_id == 0,
+                        Err(_) => false, // If we can't get the lock, don't ignore
+                    };
 
-                if let SocketAddr::V4(src) = src {
-                    debug!(
-                        "Received message type {} from peer {}",
-                        header.message_type, header.ident
-                    );
-                    match header.message_type {
-                        ALIVE => {
-                            if !is_enabled {
-                                debug!(
-                                    "ignoring ALIVE message from peer {} because Link is disabled",
-                                    header.ident
+                    if should_ignore {
+                        debug!("ignoring messages from self (peer {})", header.ident);
+                        continue;
+                    } else {
+                        debug!(
+                            "received message type {} from peer {} at {}",
+                            MESSAGE_TYPES[header.message_type as usize], header.ident, src
+                        );
+                    }
+
+                    // Check if Link is enabled before processing ALIVE and RESPONSE messages
+                    // BYEBYE messages should still be processed even when disabled to properly clean up peers
+                    let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
+                        *enabled_guard
+                    } else {
+                        false
+                    };
+
+                    if let SocketAddr::V4(src) = src {
+                        debug!(
+                            "Received message type {} from peer {}",
+                            header.message_type, header.ident
+                        );
+                        match header.message_type {
+                            ALIVE => {
+                                if !is_enabled {
+                                    debug!(
+                                        "ignoring ALIVE message from peer {} because Link is disabled",
+                                        header.ident
+                                    );
+                                    continue;
+                                }
+
+                                send_response(
+                                    socket.clone(),
+                                    peer_state.clone(),
+                                    ttl,
+                                    src,
+                                    last_broadcast_time.clone(),
                                 );
-                                continue;
+
+                                receive_peer_state(tx_event.clone(), header, &buf[header_len..amt]);
                             }
+                            RESPONSE => {
+                                if !is_enabled {
+                                    debug!("ignoring RESPONSE message from peer {} because Link is disabled", header.ident);
+                                    continue;
+                                }
 
-                            send_response(
-                                socket.clone(),
-                                peer_state.clone(),
-                                ttl,
-                                src,
-                                last_broadcast_time.clone(),
-                            )
-                            .await;
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
-                        }
-                        RESPONSE => {
-                            if !is_enabled {
-                                debug!("ignoring RESPONSE message from peer {} because Link is disabled", header.ident);
-                                continue;
+                                receive_peer_state(tx_event.clone(), header, &buf[header_len..amt]);
                             }
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
+                            BYEBYE => {
+                                info!("Received BYEBYE message from peer {}", header.ident);
+                                receive_bye_bye(tx_event.clone(), header.ident);
+                            }
+                            _ => {
+                                debug!("Unknown message type: {}", header.message_type);
+                            }
                         }
-                        BYEBYE => {
-                            info!("Received BYEBYE message from peer {}", header.ident);
-                            receive_bye_bye(tx_event.clone(), header.ident).await;
-                        }
-                        _ => todo!(),
                     }
                 }
-            }
-            // _ = n.notified() => {
-            //     break;
-            // }
-        });
+            })
+            .expect("Failed to spawn listener thread");
 
+        // Spawn broadcaster thread with 8KB stack
         broadcast_state(
             self.ttl,
             self.ttl_ratio,
@@ -195,38 +227,52 @@ impl Messenger {
             self.interface.as_ref().unwrap().clone(),
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
-            self.notifier.clone(),
+            self.stop_flag.clone(),
             self.enabled.clone(),
-        )
-        .await;
+        );
     }
 }
 
-pub async fn broadcast_state(
+pub fn broadcast_state(
     ttl: u8,
     ttl_ratio: u8,
     last_broadcast_time: Arc<Mutex<Instant>>,
     socket: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
     to: SocketAddrV4,
-    n: Arc<Notify>,
+    stop_flag: Arc<Mutex<bool>>,
     enabled: Arc<Mutex<bool>>,
 ) {
     let lbt = last_broadcast_time.clone();
     let s = socket.clone();
 
-    let mut sleep_time = Duration::default();
+    // Spawn broadcaster thread with 8KB stack
+    thread::Builder::new()
+        .stack_size(8192)
+        .name("link-broadcaster".to_string())
+        .spawn(move || {
+            let mut sleep_time = Duration::default();
 
-    loop {
-        select! {
-            _ = tokio::time::sleep(sleep_time) => {
+            loop {
+                // Check stop flag
+                if let Ok(should_stop) = stop_flag.try_lock() {
+                    if *should_stop {
+                        break;
+                    }
+                }
+
+                // Sleep
+                if sleep_time > Duration::from_millis(0) {
+                    thread::sleep(sleep_time);
+                }
+
                 let min_broadcast_period = Duration::from_millis(50);
                 let nominal_broadcast_period =
                     Duration::from_millis(ttl as u64 * 1000 / ttl_ratio as u64);
 
-                let lbt = lbt.clone();
+                let lbt_clone = lbt.clone();
 
-                let time_since_last_broadcast = match lbt.try_lock() {
+                let time_since_last_broadcast = match lbt_clone.try_lock() {
                     Ok(last_time) => {
                         if *last_time > Instant::now() {
                             0
@@ -264,28 +310,25 @@ pub async fn broadcast_state(
                     };
 
                     if should_broadcast {
-                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt_clone);
                     }
                 }
             }
-            _ = n.notified() => {
-                break;
-            }
-        }
-    }
+        })
+        .expect("Failed to spawn broadcaster thread");
 }
 
-pub async fn send_response(
+pub fn send_response(
     socket: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    send_peer_state(socket, peer_state, ttl, RESPONSE, to, last_broadcast_time).await
+    send_peer_state(socket, peer_state, ttl, RESPONSE, to, last_broadcast_time)
 }
 
-pub async fn send_message(
+pub fn send_message(
     socket: Arc<UdpSocket>,
     from: NodeId,
     ttl: u8,
@@ -299,10 +342,10 @@ pub async fn send_message(
 
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
-    let _sent_bytes = socket.send_to(&message, to).await.unwrap();
+    let _ = socket.send_to(&message, to);
 }
 
-pub async fn send_peer_state(
+pub fn send_peer_state(
     socket: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
@@ -325,15 +368,14 @@ pub async fn send_peer_state(
         message_type,
         &peer_state_clone.into(),
         to,
-    )
-    .await;
+    );
 
     if let Ok(mut last_time) = last_broadcast_time.try_lock() {
         *last_time = Instant::now();
     }
 }
 
-pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
+pub fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
     let payload = parse_payload(buf).unwrap();
     let measurement_endpoint = payload.entries.iter().find_map(|e| {
         if let PayloadEntry::MeasurementEndpointV4(me) = e {
@@ -346,26 +388,20 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
     debug!("sending peer state to gateway {}", node_state.ident());
-    let _ = tx
-        .send(OnEvent::PeerState(PeerStateMessageType {
-            node_state,
-            ttl: header.ttl,
-            measurement_endpoint,
-        }))
-        .await;
-
-    // info!("peer state sent")
+    let _ = tx.send(OnEvent::PeerState(PeerStateMessageType {
+        node_state,
+        ttl: header.ttl,
+        measurement_endpoint,
+    }));
 }
 
-pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
+pub fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
     info!("Received BYEBYE message from peer {}", node_id);
-    tokio::spawn(async move {
-        if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
-            debug!("Failed to send BYEBYE event: {:?}", e);
-        } else {
-            info!("Successfully forwarded BYEBYE event for peer {}", node_id);
-        }
-    });
+    if let Err(e) = tx.send(OnEvent::Byebye(node_id)) {
+        debug!("Failed to send BYEBYE event: {:?}", e);
+    } else {
+        info!("Successfully forwarded BYEBYE event for peer {}", node_id);
+    }
 }
 
 pub fn send_byebye(node_state: NodeId) {
@@ -377,9 +413,5 @@ pub fn send_byebye(node_state: NodeId) {
 
     let message = encode_message(node_state, 0, BYEBYE, &Payload::default()).unwrap();
 
-    let _ = socket
-        .into_std()
-        .unwrap()
-        .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
-        .unwrap();
+    let _ = socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT));
 }

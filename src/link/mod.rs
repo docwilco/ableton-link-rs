@@ -55,12 +55,9 @@ pub struct BasicLink {
 }
 
 impl BasicLink {
-    pub async fn new(bpm: f64) -> Self {
-        // Only set up tracing if not already set up
-        let _ = tracing_subscriber::fmt::try_init();
-
+    pub fn new(bpm: f64) -> Self {
         let clock = Clock::default();
-        let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
+        let controller = Controller::new(tempo::Tempo::new(bpm), clock);
 
         // Create initial client state for atomic session state
         let initial_client_state =
@@ -99,14 +96,14 @@ impl BasicLink {
 
 impl BasicLink {
     pub async fn enable(&mut self) {
-        self.controller.enable().await;
+        self.controller.enable();
 
         // Update the atomic session state to reflect the new enable state
         self.atomic_session_state.set_enabled(true);
     }
 
     pub async fn disable(&mut self) {
-        self.controller.disable().await;
+        self.controller.disable();
 
         // Update the atomic session state to reflect the new enable state
         self.atomic_session_state.set_enabled(false);

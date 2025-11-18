@@ -319,9 +319,9 @@ pub fn handle_successful_measurement(
     other_sessions: Arc<Mutex<Vec<Session>>>,
     current: Arc<Mutex<Session>>,
     clock: Clock,
-    tx_join_session: tokio::sync::mpsc::Sender<Session>,
+    tx_join_session: std::sync::mpsc::Sender<Session>,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx_measure_peer_state: std::sync::mpsc::Sender<MeasurePeerEvent>,
 ) {
     info!(
         "session {} measurement completed with result ({}, {})",

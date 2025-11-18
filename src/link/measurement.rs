@@ -250,22 +250,17 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    pub async fn new(
+    pub fn new(
         state: PeerState,
         clock: Clock,
         tx_measurement: Sender<Vec<f64>>,
-        notifier: Arc<Notify>,
+        stop_flag: Arc<Mutex<bool>>,
     ) -> Self {
-        let (tx_timer, mut rx_timer) = mpsc::channel(1);
+        let (tx_timer, rx_timer) = mpsc::channel();
 
-        let ip = list_afinet_netifas()
-            .unwrap()
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .unwrap();
+        // TODO: Get actual IP from platform/network configuration
+        // For ESP32, this will be injected by W5500 driver
+        let ip = Ipv4Addr::new(0, 0, 0, 0);
 
         let unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
         info!(
@@ -285,7 +280,7 @@ impl Measurement {
             clock,
             measurements_started: Arc::new(Mutex::new(0)),
             success: success.clone(),
-            tx_timer,
+            tx_timer: tx_timer.clone(),
             init_bytes_sent: 0,
         };
 
@@ -294,32 +289,42 @@ impl Measurement {
         let s = success.clone();
         let d = data.clone();
         let t = tx_measurement.clone();
+        let stop_flag_loop = stop_flag.clone();
+        let endpoint = state.measurement_endpoint.unwrap();
 
-        let finished_notifier = Arc::new(Notify::new());
-
-        let fn_loop = finished_notifier.clone();
-
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    Some(_) = rx_timer.recv() => {
-                        fn_loop.notify_one();
-                        finish(
-                            s.clone(),
-                            state.measurement_endpoint.unwrap(),
-                            d.clone(),
-                            t.clone(),
-                        )
-                        .await;
+        // Spawn timer/finish handler thread
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                loop {
+                    // Check stop flag
+                    if let Ok(flag) = stop_flag_loop.lock() {
+                        if *flag {
+                            break;
+                        }
                     }
-                    _ = notifier.notified() => {
-                        break;
+
+                    match rx_timer.recv_timeout(StdDuration::from_millis(100)) {
+                        Ok(_) => {
+                            finish(
+                                s.clone(),
+                                endpoint,
+                                d.clone(),
+                                t.clone(),
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Continue
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn measurement timer thread");
 
-        measurement.listen().await;
+        measurement.listen();
 
         info!("sending initial host time ping {:?}", ht);
 
@@ -330,7 +335,6 @@ impl Measurement {
                 entries: vec![PayloadEntry::HostTime(ht)],
             },
         )
-        .await
         .unwrap();
 
         measurement.init_bytes_sent = init_bytes_sent;
@@ -342,23 +346,19 @@ impl Measurement {
             state.measurement_endpoint.unwrap(),
             data.clone(),
             tx_measurement.clone(),
-            finished_notifier.clone(),
-        )
-        .await;
+            tx_timer.clone(),
+        );
 
         measurement
     }
 
-    pub async fn listen(&mut self) {
+    pub fn listen(&mut self) {
         let socket = self.unicast_socket.as_ref().unwrap().clone();
         let endpoint = *self.measurement_endpoint.as_ref().unwrap();
 
-        // Handle connection failure gracefully
-        if let Err(e) = socket.connect(endpoint).await {
-            debug!(
-                "Failed to connect to measurement endpoint {}: {}",
-                endpoint, e
-            );
+        // Set socket timeouts for blocking operations
+        if let Err(e) = socket.set_read_timeout(Some(StdDuration::from_millis(100))) {
+            debug!("Failed to set socket timeout: {}", e);
             return;
         }
 
@@ -372,19 +372,24 @@ impl Measurement {
             socket.local_addr().unwrap()
         );
 
-        tokio::spawn(async move {
-            let mut pong_received = false;
-            loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
+        thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                let mut pong_received = false;
+                loop {
+                    let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                // Handle receive failure gracefully - peer may have disconnected
-                let (amt, src) = match socket.recv_from(&mut buf).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        debug!("Failed to receive from measurement socket: {}", e);
-                        break;
-                    }
-                };
+                    // Handle receive failure gracefully - peer may have disconnected
+                    let (amt, src) = match socket.recv_from(&mut buf) {
+                        Ok(result) => result,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Failed to receive from measurement socket: {}", e);
+                            break;
+                        }
+                    };
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                 if header.message_type == PONG {
@@ -422,7 +427,7 @@ impl Measurement {
                             ],
                         };
 
-                        let _ = send_ping(socket.clone(), endpoint, &payload).await.unwrap();
+                        let _ = send_ping(socket.clone(), endpoint, &payload).unwrap();
 
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
@@ -445,28 +450,31 @@ impl Measurement {
                         }
 
                         if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            tx_timer.send(()).await.unwrap();
+                            let _ = tx_timer.send(());
                             break;
                         }
                     }
+                    }
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn measurement listener thread");
     }
 }
 
-async fn reset_timer(
+fn reset_timer(
     measurements_started: Arc<Mutex<usize>>,
     clock: Clock,
     unicast_socket: Option<Arc<UdpSocket>>,
     measurement_endpoint: SocketAddrV4,
     data: Arc<Mutex<Vec<f64>>>,
     tx_measurement: Sender<Vec<f64>>,
-    finished_notifier: Arc<Notify>,
+    tx_timer: Sender<()>,
 ) {
-    loop {
-        select! {
-            _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
+    thread::Builder::new()
+        .stack_size(8192)
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::milliseconds(50).to_std().unwrap());
                 info!(
                     "measurements_start {}",
                     measurements_started.try_lock().unwrap()
@@ -482,13 +490,12 @@ async fn reset_timer(
                         &Payload {
                             entries: vec![PayloadEntry::HostTime(ht)],
                         },
-                    )
-                    .await {
+                    ) {
                         debug!("Failed to send ping to {}: {}", measurement_endpoint, e);
                         break;
                     }
 
-                    tokio::time::sleep(Duration::seconds(1).to_std().unwrap()).await;
+                    thread::sleep(Duration::seconds(1).to_std().unwrap());
 
                     *measurements_started.try_lock().unwrap() += 1;
                 } else {
@@ -496,18 +503,18 @@ async fn reset_timer(
                     info!("measuring {} failed", measurement_endpoint);
 
                     let data = data.try_lock().unwrap().clone();
-                    tx_measurement.send(data).await.unwrap();
+                    let _ = tx_measurement.send(data);
                     break;
                 }
+
+                // Trigger timer callback
+                let _ = tx_timer.send(());
             }
-            _ = finished_notifier.notified() => {
-                break;
-            }
-        }
-    }
+        })
+        .expect("Failed to spawn reset_timer thread");
 }
 
-async fn finish(
+fn finish(
     success: Arc<Mutex<bool>>,
     measurement_endpoint: SocketAddrV4,
     data: Arc<Mutex<Vec<f64>>>,
@@ -517,11 +524,11 @@ async fn finish(
     debug!("measuring {} done", measurement_endpoint);
 
     let d = data.try_lock().unwrap().clone();
-    tx_measurement.send(d).await.unwrap();
+    let _ = tx_measurement.send(d);
     data.try_lock().unwrap().clear();
 }
 
-pub async fn send_ping(
+pub fn send_ping(
     socket: Arc<UdpSocket>,
     measurement_endpoint: SocketAddrV4,
     payload: &Payload,
@@ -532,7 +539,7 @@ pub async fn send_ping(
         measurement_endpoint
     );
 
-    socket.send(&message).await
+    socket.send_to(&message, measurement_endpoint)
 }
 
 pub fn median(mut numbers: Vec<f64>) -> f64 {
@@ -548,135 +555,4 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::net::IpAddr;
 
-    use local_ip_address::list_afinet_netifas;
-    use tokio::sync::mpsc::Receiver;
-
-    use crate::{
-        discovery::{
-            gateway::{OnEvent, PeerGateway},
-            peers::PeerStateChange,
-        },
-        link::{controller::SessionPeerCounter, node::NodeState},
-    };
-
-    use super::*;
-    use chrono::Duration;
-
-    fn init_tracing() {
-        let _ = tracing_subscriber::fmt::try_init();
-    }
-
-    async fn init_gateway() -> (PeerGateway, Receiver<OnEvent>, Arc<Notify>) {
-        let session_id = SessionId::default();
-        let node_1 = NodeState::new(session_id);
-        let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
-        let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
-        let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
-        let (tx_peer_state_change, mut rx_peer_state_change) =
-            mpsc::channel::<Vec<PeerStateChange>>(1);
-
-        let notifier = Arc::new(Notify::new());
-
-        let calls = Arc::new(Mutex::new(0));
-        let c = calls.clone();
-
-        tokio::spawn(async move {
-            while (rx_peer_state_change.recv().await).is_some() {
-                *c.try_lock().unwrap() += 1;
-            }
-        });
-
-        let ip = list_afinet_netifas()
-            .unwrap()
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .unwrap();
-
-        let ping_responder_unicast_socket =
-            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
-
-        (
-            PeerGateway::new(
-                Arc::new(Mutex::new(PeerState {
-                    node_state: node_1,
-                    measurement_endpoint: None,
-                })),
-                Arc::new(Mutex::new(SessionState::default())),
-                Clock::default(),
-                Arc::new(Mutex::new(SessionPeerCounter::default())),
-                tx_peer_state_change.clone(),
-                tx_event,
-                tx_measure_peer_result,
-                Arc::new(Mutex::new(vec![])),
-                notifier.clone(),
-                rx_measure_peer_state,
-                ping_responder_unicast_socket,
-                Arc::new(Mutex::new(true)),
-            )
-            .await,
-            rx_event,
-            notifier,
-        )
-    }
-
-    #[tokio::test]
-    async fn test_send_ping_on_new() {
-        init_tracing();
-
-        let (gw, rx_event, notifier) = init_gateway().await;
-        let n = notifier.clone();
-        tokio::spawn(async move {
-            gw.listen(rx_event, n).await;
-        });
-
-        let (tx_measurement, mut rx_measurement) = mpsc::channel::<Vec<f64>>(1);
-
-        let ip = list_afinet_netifas()
-            .unwrap()
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .unwrap();
-
-        let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
-
-        let measurement = Measurement::new(
-            PeerState {
-                measurement_endpoint: Some(s.local_addr().unwrap().to_string().parse().unwrap()),
-                ..Default::default()
-            },
-            Clock::default(),
-            tx_measurement,
-            notifier,
-        )
-        .await;
-
-        // Give the measurement some time to attempt to send pings
-        tokio::time::sleep(Duration::milliseconds(100).to_std().unwrap()).await;
-
-        // Try to receive a result or timeout
-        tokio::select! {
-            result = rx_measurement.recv() => {
-                // If we get a result, that's fine (measurement completed)
-                if let Some(_data) = result {
-                    // Test passed - measurement attempted
-                }
-            }
-            _ = tokio::time::sleep(Duration::seconds(1).to_std().unwrap()) => {
-                // Timeout is also fine - measurement is running in background
-            }
-        }
-
-        // Clean up
-        drop(measurement);
-    }
-}

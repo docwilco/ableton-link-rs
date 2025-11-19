@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Sender, Receiver},
+        mpsc::{self, Sender},
     },
     thread,
     time::Duration as StdDuration,

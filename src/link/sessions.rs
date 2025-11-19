@@ -99,7 +99,7 @@ impl Sessions {
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         clock: Clock,
         tx_join_session: Sender<Session>,
-        mut rx_measure_peer_result: Receiver<MeasurePeerEvent>,
+        rx_measure_peer_result: Receiver<MeasurePeerEvent>,
     ) -> Self {
         let other_sessions = Arc::new(Mutex::new(vec![init.clone()]));
         let current = Arc::new(Mutex::new(init));

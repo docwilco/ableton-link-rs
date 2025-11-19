@@ -1,7 +1,7 @@
 use std::{
-    net::{IpAddr, SocketAddrV4},
+    net::SocketAddrV4,
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::Receiver,
         Arc, Mutex,
     },
     thread,
@@ -52,6 +52,16 @@ pub struct Controller {
     stop_flag: Arc<Mutex<bool>>,
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        // Signal background threads to stop
+        if let Ok(mut flag) = self.stop_flag.lock() {
+            *flag = true;
+        }
+        // Threads will detect the flag on their next recv_timeout and exit cleanly
+    }
+}
+
 impl Controller {
     pub fn new(
         tempo: tempo::Tempo,
@@ -59,6 +69,7 @@ impl Controller {
         // tempo_callback: Option<TempoCallback>,
         // start_stop_callback: Option<StartStopCallback>,
         clock: Clock,
+        local_ip: std::net::Ipv4Addr,
     ) -> Self {
         let node_id = NodeId::new();
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
@@ -75,12 +86,23 @@ impl Controller {
 
         let (tx_measure_peer_state, rx_measure_peer_state) = std::sync::mpsc::channel();
         let (tx_measure_peer_result, rx_measure_peer_result) = std::sync::mpsc::channel();
-        let (tx_peer_state_change, mut rx_peer_state_change) = std::sync::mpsc::channel();
+        let (tx_peer_state_change, rx_peer_state_change) = std::sync::mpsc::channel();
         let (tx_event, rx_event) = std::sync::mpsc::channel::<OnEvent>();
-        let (tx_join_session, mut rx_join_session) = std::sync::mpsc::channel::<Session>();
+        let (tx_join_session, rx_join_session) = std::sync::mpsc::channel::<Session>();
 
         let peers = Arc::new(Mutex::new(vec![]));
         let stop_flag = Arc::new(Mutex::new(false));
+
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(local_ip, 0).into()).unwrap());
+
+        let measurement_endpoint = ping_responder_unicast_socket
+            .local_addr()
+            .ok()
+            .and_then(|addr| match addr {
+                std::net::SocketAddr::V4(v4) => Some(v4),
+                _ => None,
+            });
 
         let peer_state = Arc::new(Mutex::new(PeerState {
             node_state: NodeState {
@@ -89,15 +111,8 @@ impl Controller {
                 timeline,
                 start_stop_state: StartStopState::default(),
             },
-            measurement_endpoint: None,
+            measurement_endpoint,
         }));
-
-        // Get local IP from platform - will be injected by ESP32 ethernet driver
-        // For now, use a placeholder that will be replaced
-        let ip = std::net::Ipv4Addr::new(0, 0, 0, 0);
-
-        let ping_responder_unicast_socket =
-            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let discovery = Arc::new(
             PeerGateway::new(

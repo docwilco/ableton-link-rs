@@ -55,9 +55,9 @@ pub struct BasicLink {
 }
 
 impl BasicLink {
-    pub fn new(bpm: f64) -> Self {
+    pub fn new(bpm: f64, local_ip: std::net::Ipv4Addr) -> Self {
         let clock = Clock::default();
-        let controller = Controller::new(tempo::Tempo::new(bpm), clock);
+        let controller = Controller::new(tempo::Tempo::new(bpm), clock, local_ip);
 
         // Create initial client state for atomic session state
         let initial_client_state =
@@ -95,14 +95,14 @@ impl BasicLink {
 }
 
 impl BasicLink {
-    pub async fn enable(&mut self) {
+    pub fn enable(&mut self) {
         self.controller.enable();
 
         // Update the atomic session state to reflect the new enable state
         self.atomic_session_state.set_enabled(true);
     }
 
-    pub async fn disable(&mut self) {
+    pub fn disable(&mut self) {
         self.controller.disable();
 
         // Update the atomic session state to reflect the new enable state

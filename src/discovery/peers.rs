@@ -37,7 +37,7 @@ pub struct GatewayObserver {
 
 impl GatewayObserver {
     pub fn new(
-        mut on_peer_event: Receiver<PeerEvent>,
+        on_peer_event: Receiver<PeerEvent>,
         peer_state: Arc<Mutex<PeerState>>,
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,

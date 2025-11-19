@@ -149,8 +149,8 @@ impl MeasurementService {
             clock,
             ping_responder: PingResponder::new(
                 ping_responder_unicast_socket,
-                peer_state.try_lock().unwrap().session_id(),
-                session_state.try_lock().unwrap().ghost_x_form,
+                peer_state.lock().unwrap().session_id(),
+                session_state.lock().unwrap().ghost_x_form,
                 clock,
             ),
             tx_measure_peer: tx_measure_peer_result,
@@ -184,7 +184,7 @@ pub fn measure_peer(
 
     let measurement = Measurement::new(state, clock, tx_measurement, stop_flag.clone());
     measurement_map
-        .try_lock()
+        .lock()
         .unwrap()
         .insert(node_id, measurement);
 
@@ -218,7 +218,7 @@ pub fn measure_peer(
                                 ));
                         }
 
-                        measurement_map_loop.try_lock().unwrap().remove(&node_id);
+                        measurement_map_loop.lock().unwrap().remove(&node_id);
                         break;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -432,7 +432,7 @@ impl Measurement {
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
                         {
-                            data.try_lock().unwrap().push(
+                            data.lock().unwrap().push(
                                 ghost_time.num_microseconds().unwrap() as f64
                                     - ((host_time + prev_host_time).num_microseconds().unwrap()
                                         as f64
@@ -440,7 +440,7 @@ impl Measurement {
                             );
 
                             if prev_ghost_time != Duration::microseconds(0) {
-                                data.try_lock().unwrap().push(
+                                data.lock().unwrap().push(
                                     ((ghost_time + prev_ghost_time).num_microseconds().unwrap()
                                         as f64
                                         * 0.5)
@@ -449,7 +449,7 @@ impl Measurement {
                             }
                         }
 
-                        if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
+                        if data.lock().unwrap().len() > NUMBER_DATA_POINTS {
                             let _ = tx_timer.send(());
                             break;
                         }
@@ -477,9 +477,9 @@ fn reset_timer(
                 thread::sleep(Duration::milliseconds(50).to_std().unwrap());
                 info!(
                     "measurements_start {}",
-                    measurements_started.try_lock().unwrap()
+                    measurements_started.lock().unwrap()
                 );
-                if *measurements_started.try_lock().unwrap() < NUMBER_MEASUREMENTS {
+                if *measurements_started.lock().unwrap() < NUMBER_MEASUREMENTS {
                     let ht = HostTime {
                         time: clock.micros(),
                     };
@@ -497,12 +497,12 @@ fn reset_timer(
 
                     thread::sleep(Duration::seconds(1).to_std().unwrap());
 
-                    *measurements_started.try_lock().unwrap() += 1;
+                    *measurements_started.lock().unwrap() += 1;
                 } else {
-                    data.try_lock().unwrap().clear();
+                    data.lock().unwrap().clear();
                     info!("measuring {} failed", measurement_endpoint);
 
-                    let data = data.try_lock().unwrap().clone();
+                    let data = data.lock().unwrap().clone();
                     let _ = tx_measurement.send(data);
                     break;
                 }
@@ -520,12 +520,12 @@ fn finish(
     data: Arc<Mutex<Vec<f64>>>,
     tx_measurement: Sender<Vec<f64>>,
 ) {
-    *success.try_lock().unwrap() = true;
+    *success.lock().unwrap() = true;
     debug!("measuring {} done", measurement_endpoint);
 
-    let d = data.try_lock().unwrap().clone();
+    let d = data.lock().unwrap().clone();
     let _ = tx_measurement.send(d);
-    data.try_lock().unwrap().clear();
+    data.lock().unwrap().clear();
 }
 
 pub fn send_ping(

@@ -172,17 +172,17 @@ impl Sessions {
     }
 
     pub fn reset_session(&mut self, session: Session) {
-        *self.current.try_lock().unwrap() = session;
-        self.other_sessions.try_lock().unwrap().clear()
+        *self.current.lock().unwrap() = session;
+        self.other_sessions.lock().unwrap().clear()
     }
 
     pub fn reset_timeline(&self, timeline: Timeline) {
         if let Some(session) = self
             .other_sessions
-            .try_lock()
+            .lock()
             .unwrap()
             .iter_mut()
-            .find(|s| s.session_id == self.current.try_lock().unwrap().session_id)
+            .find(|s| s.session_id == self.current.lock().unwrap().session_id)
         {
             session.timeline = timeline;
         }
@@ -198,16 +198,16 @@ impl Sessions {
             timeline, session_id,
         );
 
-        if self.current.try_lock().unwrap().session_id == session_id {
-            let session = self.update_timeline(self.current.try_lock().unwrap().clone(), timeline);
-            self.current.try_lock().unwrap().timeline = session.timeline;
-            if !*self.has_joined.try_lock().unwrap() {
+        if self.current.lock().unwrap().session_id == session_id {
+            let session = self.update_timeline(self.current.lock().unwrap().clone(), timeline);
+            self.current.lock().unwrap().timeline = session.timeline;
+            if !*self.has_joined.lock().unwrap() {
                 debug!(
                     "updating current session {} with timeline {:?}",
                     session_id, session.timeline
                 );
 
-                *self.has_joined.try_lock().unwrap() = true;
+                *self.has_joined.lock().unwrap() = true;
             }
         } else {
             let session = Session {
@@ -221,7 +221,7 @@ impl Sessions {
 
             let s = self
                 .other_sessions
-                .try_lock()
+                .lock()
                 .unwrap()
                 .iter()
                 .cloned()
@@ -234,11 +234,11 @@ impl Sessions {
                     "updating already seen session {} with timeline {:?}",
                     session_id, session.timeline
                 );
-                self.other_sessions.try_lock().unwrap()[idx].timeline = session.timeline;
+                self.other_sessions.lock().unwrap()[idx].timeline = session.timeline;
             } else {
                 info!("adding session {} to other sessions", session_id);
                 self.other_sessions
-                    .try_lock()
+                    .lock()
                     .unwrap()
                     .push(session.clone());
 
@@ -250,7 +250,7 @@ impl Sessions {
             }
         }
 
-        self.current.try_lock().unwrap().timeline
+        self.current.lock().unwrap().timeline
     }
 
     pub fn update_timeline(&self, mut session: Session, timeline: Timeline) -> Session {
@@ -335,18 +335,18 @@ pub fn handle_successful_measurement(
         timestamp: clock.micros(),
     };
 
-    let current_session_id = current.try_lock().unwrap().session_id;
+    let current_session_id = current.lock().unwrap().session_id;
     debug!("Current session: {}, measured session: {}", current_session_id, session_id);
 
     if current_session_id == session_id {
-        current.try_lock().unwrap().measurement = measurement;
-        let session = current.try_lock().unwrap().clone();
+        current.lock().unwrap().measurement = measurement;
+        let session = current.lock().unwrap().clone();
         if let Err(e) = tx_join_session.send(session) {
             debug!("Failed to send session join event: {}", e);
         }
     } else {
         let s = other_sessions
-            .try_lock()
+            .lock()
             .unwrap()
             .iter()
             .cloned()
@@ -358,7 +358,7 @@ pub fn handle_successful_measurement(
 
             let host_time = clock.micros();
             let cur_ghost = current
-                .try_lock()
+                .lock()
                 .unwrap()
                 .measurement
                 .x_form
@@ -366,7 +366,7 @@ pub fn handle_successful_measurement(
             let new_ghost = measurement.x_form.host_to_ghost(host_time);
 
             s.measurement = measurement;
-            other_sessions.try_lock().unwrap()[idx] = s.clone();
+            other_sessions.lock().unwrap()[idx] = s.clone();
 
             let ghost_diff = new_ghost - cur_ghost;
             debug!("Ghost time comparison: current={} us, new={} us, diff={} us, eps={} us", 
@@ -379,9 +379,9 @@ pub fn handle_successful_measurement(
             // 1. Always join if we have significantly better timing (>500ms)
             // 2. Join if times are similar and we prefer older session IDs
             // 3. Join if we just started up and have no peers (prefer any established session)
-            let current_session_has_no_peers = session_peers(peers.clone(), current.try_lock().unwrap().session_id).is_empty();
+            let current_session_has_no_peers = session_peers(peers.clone(), current.lock().unwrap().session_id).is_empty();
             let just_started = current_session_has_no_peers && measurement.timestamp < Duration::seconds(5);
-            let current_session_id = current.try_lock().unwrap().session_id;
+            let current_session_id = current.lock().unwrap().session_id;
             
             let should_switch = 
                 // Significant timing advantage
@@ -398,11 +398,11 @@ pub fn handle_successful_measurement(
                       ghost_diff.num_microseconds().unwrap(),
                       just_started,
                       s.timeline.tempo.bpm());
-                let c = current.try_lock().unwrap().clone();
+                let c = current.lock().unwrap().clone();
 
-                *current.try_lock().unwrap() = s.clone();
-                other_sessions.try_lock().unwrap().remove(idx);
-                other_sessions.try_lock().unwrap().insert(idx, c);
+                *current.lock().unwrap() = s.clone();
+                other_sessions.lock().unwrap().remove(idx);
+                other_sessions.lock().unwrap().insert(idx, c);
 
                 if let Err(e) = tx_join_session.send(s.clone()) {
                     debug!("Failed to send session join event: {}", e);
@@ -428,12 +428,12 @@ pub fn handle_failed_measurement(
 ) {
     info!("session {} measurement failed", session_id);
 
-    if current.try_lock().unwrap().session_id == session_id {
-        let current = current.try_lock().unwrap().clone();
+    if current.lock().unwrap().session_id == session_id {
+        let current = current.lock().unwrap().clone();
         schedule_remeasurement(peers, tx_measure_peer, current);
     } else {
         let s = other_sessions
-            .try_lock()
+            .lock()
             .unwrap()
             .iter()
             .cloned()
@@ -441,10 +441,10 @@ pub fn handle_failed_measurement(
             .find(|(_, s)| s.session_id != session_id);
 
         if let Some((idx, _)) = s {
-            other_sessions.try_lock().unwrap().remove(idx);
+            other_sessions.lock().unwrap().remove(idx);
 
             let p = peers
-                .try_lock()
+                .lock()
                 .unwrap()
                 .iter()
                 .cloned()
@@ -453,7 +453,7 @@ pub fn handle_failed_measurement(
                 .collect::<Vec<_>>();
 
             for (idx, _) in p {
-                peers.try_lock().unwrap().remove(idx);
+                peers.lock().unwrap().remove(idx);
             }
         }
     }
@@ -480,8 +480,8 @@ pub fn session_peers(
     session_id: SessionId,
 ) -> Vec<ControllerPeer> {
     let mut peers = peers
-        .try_lock()
-        .unwrap()
+        .lock()
+        .expect("Peers mutex poisoned")
         .iter()
         .filter(|p| p.peer_state.session_id() == session_id)
         .cloned()

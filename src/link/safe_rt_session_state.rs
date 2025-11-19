@@ -103,7 +103,7 @@ impl SafeRtSessionStateHandler {
         // Try to get new state if grace periods have expired and there are updates
         if timeline_grace_expired || start_stop_grace_expired {
             // Try to check for new data from the triple buffer (non-blocking)
-            if let Ok(mut output) = self.client_state_output.try_lock() {
+            if let Ok(mut output) = self.client_state_output.lock() {
                 // Check if there's new data available
                 if output.updated() {
                     let new_state = output.read().clone();
@@ -139,7 +139,7 @@ impl SafeRtSessionStateHandler {
 
     /// Update the real-time client state with new data
     /// This should only be called from the real-time thread
-    /// Uses try_lock operations to avoid blocking
+    /// Uses lock operations for proper blocking behavior
     pub fn update_rt_client_state(
         &self,
         incoming_state: IncomingClientState,
@@ -172,7 +172,7 @@ impl SafeRtSessionStateHandler {
             }
 
             // Try to send updated state to non-RT thread via triple buffer (non-blocking)
-            if let Ok(mut input) = self.client_state_input.try_lock() {
+            if let Ok(mut input) = self.client_state_input.lock() {
                 input.write(cached_state.clone().into());
                 
                 // Mark that we have pending updates

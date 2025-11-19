@@ -109,11 +109,11 @@ impl PingResponder {
                         }
 
                         let id = SessionMembership {
-                            session_id: *session_id.try_lock().unwrap(),
+                            session_id: *session_id.lock().unwrap(),
                         };
                         let current_gt = GhostTime {
                             time: ghost_x_form
-                                .try_lock()
+                                .lock()
                                 .unwrap()
                                 .host_to_ghost(clock.micros()),
                         };
@@ -146,8 +146,8 @@ impl PingResponder {
     }
 
     pub fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self.session_id.try_lock().unwrap() = session_id;
-        *self.ghost_x_form.try_lock().unwrap() = x_form;
+        *self.session_id.lock().unwrap() = session_id;
+        *self.ghost_x_form.lock().unwrap() = x_form;
     }
 }
 

@@ -118,7 +118,7 @@ impl Messenger {
 
                 loop {
                     // Check stop flag
-                    if let Ok(should_stop) = stop_flag.try_lock() {
+                    if let Ok(should_stop) = stop_flag.lock() {
                         if *should_stop {
                             break;
                         }
@@ -150,7 +150,7 @@ impl Messenger {
                     };
 
                     // TODO figure out how to encode group ID
-                    let should_ignore = match peer_state.try_lock() {
+                    let should_ignore = match peer_state.lock() {
                         Ok(guard) => header.ident == guard.ident() && header.group_id == 0,
                         Err(_) => false, // If we can't get the lock, don't ignore
                     };
@@ -167,7 +167,7 @@ impl Messenger {
 
                     // Check if Link is enabled before processing ALIVE and RESPONSE messages
                     // BYEBYE messages should still be processed even when disabled to properly clean up peers
-                    let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
+                    let is_enabled = if let Ok(enabled_guard) = enabled.lock() {
                         *enabled_guard
                     } else {
                         false
@@ -255,7 +255,7 @@ pub fn broadcast_state(
 
             loop {
                 // Check stop flag
-                if let Ok(should_stop) = stop_flag.try_lock() {
+                if let Ok(should_stop) = stop_flag.lock() {
                     if *should_stop {
                         break;
                     }
@@ -272,7 +272,7 @@ pub fn broadcast_state(
 
                 let lbt_clone = lbt.clone();
 
-                let time_since_last_broadcast = match lbt_clone.try_lock() {
+                let time_since_last_broadcast = match lbt_clone.lock() {
                     Ok(last_time) => {
                         if *last_time > Instant::now() {
                             0
@@ -303,7 +303,7 @@ pub fn broadcast_state(
 
                 if delay < Duration::from_millis(1) {
                     // Only broadcast if Link is enabled
-                    let should_broadcast = if let Ok(enabled_guard) = enabled.try_lock() {
+                    let should_broadcast = if let Ok(enabled_guard) = enabled.lock() {
                         *enabled_guard
                     } else {
                         false
@@ -353,7 +353,7 @@ pub fn send_peer_state(
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    let (ident, peer_state_clone) = match peer_state.try_lock() {
+    let (ident, peer_state_clone) = match peer_state.lock() {
         Ok(guard) => (guard.ident(), guard.clone()),
         Err(_) => {
             // If we can't get the lock, skip this broadcast
@@ -370,7 +370,7 @@ pub fn send_peer_state(
         to,
     );
 
-    if let Ok(mut last_time) = last_broadcast_time.try_lock() {
+    if let Ok(mut last_time) = last_broadcast_time.lock() {
         *last_time = Instant::now();
     }
 }

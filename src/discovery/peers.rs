@@ -81,7 +81,7 @@ impl GatewayObserver {
     }
 
     pub fn set_session_timeline(&mut self, session_id: SessionId, timeline: Timeline) {
-        if let Ok(mut peers) = self.peers.try_lock() {
+        if let Ok(mut peers) = self.peers.lock() {
             peers.iter_mut().for_each(|peer| {
                 if peer.peer_state.session_id() == session_id {
                     peer.peer_state.node_state.timeline = timeline;
@@ -93,7 +93,7 @@ impl GatewayObserver {
     }
 
     pub fn forget_session(&mut self, session_id: Arc<Mutex<SessionId>>) {
-        let session_id_val = match session_id.try_lock() {
+        let session_id_val = match session_id.lock() {
             Ok(guard) => *guard,
             Err(_) => {
                 debug!("Could not acquire session_id lock in forget_session");
@@ -101,7 +101,7 @@ impl GatewayObserver {
             }
         };
 
-        if let Ok(mut peers) = self.peers.try_lock() {
+        if let Ok(mut peers) = self.peers.lock() {
             peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
         } else {
             debug!("Could not acquire peers lock in forget_session");
@@ -109,7 +109,7 @@ impl GatewayObserver {
     }
 
     pub fn reset_peers(&self) {
-        if let Ok(mut peers) = self.peers.try_lock() {
+        if let Ok(mut peers) = self.peers.lock() {
             peers.clear();
         } else {
             debug!("Could not acquire peers lock in reset_peers");
@@ -146,7 +146,7 @@ pub fn unique_session_peer_count(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_node_id: NodeId,
 ) -> usize {
-    let all_peers = match peers.try_lock() {
+    let all_peers = match peers.lock() {
         Ok(guard) => guard,
         Err(_) => {
             debug!("Could not acquire peers lock in unique_session_peer_count, returning 0");
@@ -222,7 +222,7 @@ fn saw_peer(
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {
     // Additional safety check: Don't add ourselves to our own peer list
-    let self_ident = match self_peer_state.try_lock() {
+    let self_ident = match self_peer_state.lock() {
         Ok(guard) => guard.ident(),
         Err(_) => {
             debug!("Could not acquire self_peer_state lock in saw_peer, skipping self-check");
@@ -248,7 +248,7 @@ fn saw_peer(
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
 
-    let is_new_session_timeline = match peers.try_lock() {
+    let is_new_session_timeline = match peers.lock() {
         Ok(guard) => !guard.iter().any(|p| {
             p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
         }),
@@ -258,7 +258,7 @@ fn saw_peer(
         }
     };
 
-    let is_new_session_start_stop_state = match peers.try_lock() {
+    let is_new_session_start_stop_state = match peers.lock() {
         Ok(guard) => !guard
             .iter()
             .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state),
@@ -270,7 +270,7 @@ fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
-    let existing_peer_index = match peers.try_lock() {
+    let existing_peer_index = match peers.lock() {
         Ok(guard) => guard
             .iter()
             .position(|p| p.peer_state.ident() == peer.peer_state.ident()),
@@ -282,7 +282,7 @@ fn saw_peer(
 
     let did_session_membership_change = if let Some(index) = existing_peer_index {
         // Update existing peer with new state
-        match peers.try_lock() {
+        match peers.lock() {
             Ok(mut guard) => {
                 let old_session_id = guard[index].peer_state.session_id();
                 guard[index] = peer.clone();
@@ -296,7 +296,7 @@ fn saw_peer(
         }
     } else {
         // Add new peer
-        match peers.try_lock() {
+        match peers.lock() {
             Ok(mut guard) => {
                 guard.push(peer.clone());
                 true
@@ -347,7 +347,7 @@ fn peer_left(
     info!("Processing peer_left for node {}", node_id);
 
     let mut did_session_membership_change = false;
-    if let Ok(mut peers_guard) = peers.try_lock() {
+    if let Ok(mut peers_guard) = peers.lock() {
         let initial_count = peers_guard.len();
         peers_guard.retain(|peer| {
             if peer.peer_state.ident() == node_id {

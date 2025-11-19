@@ -61,7 +61,7 @@ impl BasicLink {
 
         // Create initial client state for atomic session state
         let initial_client_state =
-            if let Ok(client_state_guard) = controller.client_state.try_lock() {
+            if let Ok(client_state_guard) = controller.client_state.lock() {
                 *client_state_guard
             } else {
                 // Fallback to default state if we can't get the lock
@@ -134,7 +134,7 @@ impl BasicLink {
         // Trigger initial callback with current peer count
         let current_count = self.num_peers();
         if let Some(ref callback) = self.peer_count_callback {
-            if let Ok(callback) = callback.try_lock() {
+            if let Ok(callback) = callback.lock() {
                 callback(current_count);
             }
         }
@@ -147,9 +147,9 @@ impl BasicLink {
         self.tempo_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
 
         // Trigger initial callback with current tempo
-        if let Ok(client_state) = self.controller.client_state.try_lock() {
+        if let Ok(client_state) = self.controller.client_state.lock() {
             if let Some(ref callback) = self.tempo_callback {
-                if let Ok(callback) = callback.try_lock() {
+                if let Ok(callback) = callback.lock() {
                     callback(client_state.timeline.tempo.bpm());
                 }
             }
@@ -163,10 +163,10 @@ impl BasicLink {
         self.start_stop_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
 
         // Update our cached playing state and trigger initial callback
-        if let Ok(client_state) = self.controller.client_state.try_lock() {
+        if let Ok(client_state) = self.controller.client_state.lock() {
             self.last_is_playing_for_callback = client_state.start_stop_state.is_playing;
             if let Some(ref callback) = self.start_stop_callback {
-                if let Ok(callback) = callback.try_lock() {
+                if let Ok(callback) = callback.lock() {
                     callback(self.last_is_playing_for_callback);
                 }
             }
@@ -196,7 +196,7 @@ impl BasicLink {
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {
-        if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
+        if let Ok(client_state_guard) = self.controller.client_state.lock() {
             to_session_state(&client_state_guard, self.num_peers() > 0)
         } else {
             // Return a default state if we can't get the lock
@@ -226,7 +226,7 @@ impl BasicLink {
         // Invoke start/stop callback if needed
         if should_invoke_callback {
             if let Some(ref callback) = self.start_stop_callback {
-                if let Ok(callback) = callback.try_lock() {
+                if let Ok(callback) = callback.lock() {
                     callback(self.last_is_playing_for_callback);
                 }
             }
@@ -234,8 +234,8 @@ impl BasicLink {
 
         // Check for tempo changes and invoke callback
         if let Some(ref callback) = self.tempo_callback {
-            if let Ok(client_state) = self.controller.client_state.try_lock() {
-                if let Ok(callback) = callback.try_lock() {
+            if let Ok(client_state) = self.controller.client_state.lock() {
+                if let Ok(callback) = callback.lock() {
                     callback(client_state.timeline.tempo.bpm());
                 }
             }

@@ -8,7 +8,7 @@ use std::{
     vec,
 };
 
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::link::{
     controller::SessionPeerCounter,

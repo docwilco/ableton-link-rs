@@ -2,7 +2,7 @@ use std::mem;
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 use crate::{
     discovery::{peers::PeerState, ENCODING_CONFIG},

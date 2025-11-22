@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
@@ -48,7 +48,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     {
         // We could use socket2's raw methods here, but for maximum safety
         // we'll skip the SO_REUSEPORT optimization. The socket will still work.
-        tracing::debug!("Note: SO_REUSEPORT not set (using safe implementation)");
+        debug!("Note: SO_REUSEPORT not set (using safe implementation)");
     }
 
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
@@ -82,11 +82,31 @@ impl Messenger {
         stop_flag: Arc<Mutex<bool>>,
         enabled: Arc<Mutex<bool>>,
     ) -> Self {
-        let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
-        socket
-            .join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::new(0, 0, 0, 0))
-            .unwrap();
-        socket.set_multicast_loop_v4(true).unwrap();
+        // Retry socket creation and multicast join to handle ESP32 network initialization timing
+        let socket = loop {
+            match new_udp_reuseport(MULTICAST_IP_ANY.into()) {
+                Ok(sock) => {
+                    match sock.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::new(0, 0, 0, 0)) {
+                        Ok(()) => {
+                            if let Err(e) = sock.set_multicast_loop_v4(true) {
+                                debug!("Failed to set multicast loop: {}, retrying in 100ms", e);
+                                thread::sleep(Duration::from_millis(100));
+                                continue;
+                            }
+                            break sock;
+                        }
+                        Err(e) => {
+                            debug!("Failed to join multicast group: {}, retrying in 100ms", e);
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to create UDP socket: {}, retrying in 100ms", e);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
 
         Messenger {
             interface: Some(Arc::new(socket)),
@@ -407,11 +427,31 @@ pub fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
-    socket.set_broadcast(true).unwrap();
-    socket.set_multicast_ttl_v4(2).unwrap();
+    // Best-effort BYEBYE transmission - don't panic if network is unavailable during shutdown
+    let socket = match new_udp_reuseport(MULTICAST_IP_ANY.into()) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Failed to create socket for BYEBYE: {}", e);
+            return;
+        }
+    };
+    
+    if let Err(e) = socket.set_broadcast(true) {
+        debug!("Failed to set broadcast for BYEBYE: {}", e);
+        return;
+    }
+    if let Err(e) = socket.set_multicast_ttl_v4(2) {
+        debug!("Failed to set multicast TTL for BYEBYE: {}", e);
+        return;
+    }
 
-    let message = encode_message(node_state, 0, BYEBYE, &Payload::default()).unwrap();
+    let message = match encode_message(node_state, 0, BYEBYE, &Payload::default()) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!("Failed to encode BYEBYE message: {}", e);
+            return;
+        }
+    };
 
     let _ = socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT));
 }

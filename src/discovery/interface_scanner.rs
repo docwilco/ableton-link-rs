@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{debug, info};
+use log::{debug, info};
 
 /// Network interface scanner that monitors available network interfaces
 /// and notifies when interfaces change

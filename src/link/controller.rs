@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::Duration;
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::discovery::{
     gateway::{OnEvent, PeerGateway},
@@ -93,8 +93,16 @@ impl Controller {
         let peers = Arc::new(Mutex::new(vec![]));
         let stop_flag = Arc::new(Mutex::new(false));
 
-        let ping_responder_unicast_socket =
-            Arc::new(new_udp_reuseport(SocketAddrV4::new(local_ip, 0).into()).unwrap());
+        // Retry socket creation to handle ESP32 network initialization timing
+        let ping_responder_unicast_socket = Arc::new(loop {
+            match new_udp_reuseport(SocketAddrV4::new(local_ip, 0).into()) {
+                Ok(sock) => break sock,
+                Err(e) => {
+                    debug!("Failed to create unicast socket: {}, retrying in 100ms", e);
+                    thread::sleep(StdDuration::from_millis(100));
+                }
+            }
+        });
 
         let measurement_endpoint = ping_responder_unicast_socket
             .local_addr()

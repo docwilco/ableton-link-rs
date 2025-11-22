@@ -26,7 +26,7 @@ rand = "0.8.4"
 bincode = { version = "2.0.0-rc.3", features = ["derive", "serde"] }
 thiserror = "1.0.48"
 socket2 = "0.5.3"
-tracing = "0.1.37"
+log = "0.4"
 hex = "0.4.3"
 chrono = "0.4.31"
 triple_buffer = "8.1.1"

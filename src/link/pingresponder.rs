@@ -6,7 +6,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::{
     discovery::{messages::parse_payload, ENCODING_CONFIG},

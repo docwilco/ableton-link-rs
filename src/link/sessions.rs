@@ -11,7 +11,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
 

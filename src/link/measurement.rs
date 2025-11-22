@@ -11,7 +11,7 @@ use std::{
 };
 
 use chrono::Duration;
-use tracing::{debug, info};
+use log::{debug, info};
 
 use crate::{
     discovery::{

@@ -3,7 +3,7 @@
 // For other platforms: Would use platform-specific network enumeration
 
 use std::net::IpAddr;
-use tracing::debug;
+use log::debug;
 
 /// Scan for available network interfaces
 /// On ESP32, this will be called after ethernet initialization
